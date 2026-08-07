@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::interval;
 
 use crate::input;
-use crate::input::event::{InputEvent, KeyEvent, KeyState};
+use crate::input::event::{InputEvent, KeyEvent, KeyState, MouseButton, MouseEvent};
 use crate::net::crypto::{self, Crypter, StaticSecret};
 use crate::net::protocol::Message;
 
@@ -75,10 +75,10 @@ async fn session_server(
     // 启动捕获桥：std mpsc (capture 线程) → tokio mpsc (async 任务)
     let (etx, mut erx) = mpsc::unbounded_channel::<InputEvent>();
     if enable_capture {
-        let std_rx = input::capture::start_keyboard_capture();
+        let std_rx = input::capture::start_capture();
         let etx_c = etx.clone();
         tokio::task::spawn_blocking(move || bridge_capture_to_tokio(std_rx, etx_c));
-        log::info!("server: keyboard capture → wire enabled");
+        log::info!("server: keyboard+mouse capture → wire enabled");
     } else {
         log::info!("server: capture disabled (--no-capture)");
     }
@@ -106,6 +106,30 @@ async fn session_server(
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 let _ = etx_test.send(InputEvent::Key(KeyEvent { hid: h, state: s }));
             }
+
+            // 鼠标：一次相对移动 + 左键按下/释放
+            log::info!("test-input: sending mock mouse events (move + left button)");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = etx_test.send(InputEvent::Mouse(MouseEvent {
+                dx: 24,
+                dy: 12,
+                button: None,
+                state: None,
+            }));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = etx_test.send(InputEvent::Mouse(MouseEvent {
+                dx: 0,
+                dy: 0,
+                button: Some(MouseButton::Left),
+                state: Some(KeyState::Pressed),
+            }));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = etx_test.send(InputEvent::Mouse(MouseEvent {
+                dx: 0,
+                dy: 0,
+                button: Some(MouseButton::Left),
+                state: Some(KeyState::Released),
+            }));
             log::info!("test-input: sequence done");
         });
     }

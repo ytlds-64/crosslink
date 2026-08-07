@@ -7,11 +7,13 @@
 
 use anyhow::{anyhow, Result};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-    VIRTUAL_KEY,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 
-use crate::input::event::{InputEvent, KeyState};
+use crate::input::event::{InputEvent, KeyState, MouseButton};
 use crate::input::keycodes;
 
 /// 注入一条输入事件。返回 `Err` 表示系统调用失败。
@@ -50,6 +52,65 @@ pub fn inject(ev: InputEvent) -> Result<()> {
             if sent == 0 {
                 let err = std::io::Error::last_os_error();
                 return Err(anyhow!("SendInput failed for VK 0x{:02X}: {}", vk, err));
+            }
+            Ok(())
+        }
+        InputEvent::Mouse(m) => {
+            // 按键边沿（按下 / 释放）
+            if let (Some(btn), Some(st)) = (m.button, m.state) {
+                let (down, up) = match btn {
+                    MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+                    MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+                    MouseButton::Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+                };
+                // 按下用 down 标志，释放用 up 标志（二者互斥，取其一即可）
+                let flags: MOUSE_EVENT_FLAGS = if matches!(st, KeyState::Released) {
+                    up
+                } else {
+                    down
+                };
+                let input = INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT {
+                            dx: 0,
+                            dy: 0,
+                            mouseData: 0,
+                            dwFlags: flags,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                };
+                let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+                if sent == 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(anyhow!("SendInput (mouse button) failed: {}", err));
+                }
+                log::info!("inject: mouse button {:?} {:?}", btn, st);
+            }
+
+            // 相对位移（MOUSEEVENTF_MOVE 不带绝对标志 = 相对移动）
+            if m.dx != 0 || m.dy != 0 {
+                let input = INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT {
+                            dx: m.dx as i32,
+                            dy: m.dy as i32,
+                            mouseData: 0,
+                            dwFlags: MOUSEEVENTF_MOVE,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                };
+                let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+                if sent == 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(anyhow!("SendInput (mouse move) failed: {}", err));
+                }
+                log::info!("inject: mouse move dx={} dy={}", m.dx, m.dy);
             }
             Ok(())
         }

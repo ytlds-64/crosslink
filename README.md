@@ -2,8 +2,8 @@
 
 用一套鼠标 + 键盘无缝操控 **Windows** 与 **macOS**（Universal Control 式：光标越过屏幕边缘切到另一台，同一时刻只控制一台）。
 
-> 当前进度：**M1 ✅ + M2.2 ✅**（M1 加密传输骨架；M2.2 Windows 单向键盘端到端：捕获→加密 wire→注入）。
-> 鼠标 / 边缘切换 / macOS 端在后续里程碑（**M2.3**+）实现。
+> 当前进度：**M1 ✅ + M2.2 ✅ + M2.3 ✅**（M1 加密传输骨架；M2.2 Windows 单向键盘；M2.3 Windows 鼠标：捕获→加密 wire→注入）。
+> 边缘切换 / macOS 端在后续里程碑（**M2.4**+）实现。
 
 ---
 
@@ -119,10 +119,26 @@ cargo run --target x86_64-pc-windows-gnu -- --server --test-input
 ```
 
 **调试开关**：
-- `--no-capture`（服务端）：不抓本地键盘，但保持加密通道在线
+- `--no-capture`（服务端）：不抓本地键盘/鼠标，但保持加密通道在线
 - `--no-inject`（客户端）：不调 `SendInput`，仅做协议转发验证
 
 > 不传 `--fingerprint` 时客户端采用 TOFU（首次信任并打印警告），仅建议在受信任局域网内调试使用。
+
+### M2.3 端到端（Windows 键盘 + 鼠标）
+
+`--test-input` 现同时发送键盘（a/b/1/Tab/Enter + release）**与鼠标**（一次相对移动 dx=24/dy=12 + 左键按下/释放）的 mock 事件，客户端日志应看到：
+
+```
+inject: hid=0x0004 -> VK 0x41 state=Pressed   (A)
+...
+inject: mouse move dx=24 dy=12
+inject: mouse button Left Pressed
+inject: mouse button Left Released
+```
+
+> 注：M2.3 仍**无条件转发**所有鼠标事件（屏幕边缘切换逻辑在 M3 才加入）。真实使用时请注意：服务端捕获的鼠标位移会被注入到客户端，因此在边缘切换落地前，仅建议在测试/受控环境下运行。
+
+非 Windows / 非 macOS 平台（如 CI 的 Linux 构建）提供 no-op 输入后端，`cargo build` 可正常通过，但运行时不做任何转发（冒烟测试仅验证连通性与心跳）。
 
 ---
 
@@ -130,8 +146,8 @@ cargo run --target x86_64-pc-windows-gnu -- --server --test-input
 
 - **M1** ✅：传输骨架 — TCP 连通 + 加密握手 + 心跳
 - **M2.2** ✅：Windows 单向键盘 — `GetAsyncKeyState` 捕获 + `SendInput` 注入 + HID 键码（**本机 Win 端到端验证通过**）
-- **M2.3**：Windows 鼠标 — 鼠标移动 / 按键 / 滚轮
-- **M2.4**：macOS 端到端 — `CGEventTap` / `CGEventPost`（需辅助功能权限）
+- **M2.3** ✅：Windows 鼠标 — `GetCursorPos` 相对位移 + `GetAsyncKeyState` 按键 + `SendInput` 注入（**本机 Win 端到端验证通过**，含 `--test-input` 鼠标 mock）
+- **M2.4**（进行中）：macOS 端到端 — `CGEventTap` / `CGEventPost`（需辅助功能权限）
 - **M3**：边缘切换 — 屏幕几何 + 光标越界接管 + 反向回切
 - **M4**：发现 / 配置 / GUI — mDNS、指纹授权、设置界面
 - **M5**：增强 — 剪贴板共享、文件拖拽、加密加固、打包发布

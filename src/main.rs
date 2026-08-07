@@ -42,13 +42,13 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0")]
     bind: String,
 
-    /// Disable keyboard capture on the server (server still accepts Input messages
-    /// from peer, but won't send its own local keystrokes).
+    /// Disable keyboard+mouse capture on the server (server still accepts Input
+    /// messages from peer, but won't send its own local input).
     #[arg(long)]
     no_capture: bool,
 
-    /// Disable keyboard injection on the client (client still forwards received
-    /// Input events, but won't call SendInput locally).
+    /// Disable keyboard+mouse injection on the client (client still forwards
+    /// received Input events, but won't call SendInput locally).
     #[arg(long)]
     no_inject: bool,
 
