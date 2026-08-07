@@ -1,0 +1,24 @@
+[package]
+name = "crosslink"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform keyboard/mouse sharing (software KVM) for Windows and macOS"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+hex = "0.4"
+
+# 加密（纯 Rust，无需 C 编译器）：
+# X25519 密钥交换 + HKDF 派生会话密钥 + AES-256-GCM 认证加密
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"

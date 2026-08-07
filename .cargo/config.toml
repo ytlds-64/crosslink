@@ -1,0 +1,10 @@
+# 跨平台配置说明：
+# - 本文件**不**强制默认目标，因此每台机器 `cargo build` 默认编译为其宿主平台
+#   （Windows → msvc 需改用下方 --target；macOS → aarch64/x86_64-apple-darwin 原生；Linux → gnu）。
+# - 仅在显式 `--target x86_64-pc-windows-gnu` 时才应用下面的 gcc 链接器。
+#   这样 macOS / Linux 的原生构建不会被 Windows 专属的 rustflags 干扰。
+
+# Windows 专属：用 MinGW-w64 的 gcc 作链接器（沙箱无 VS）。
+# 仅当构建 x86_64-pc-windows-gnu 目标时生效；绝对路径避免 PATH/扩展名解析问题。
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-Clinker=C:/Users/xiao/WorkBuddy/2026-08-07-11-23-41/toolchain/mingw64/bin/gcc.exe"]

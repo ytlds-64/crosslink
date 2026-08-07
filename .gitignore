@@ -1,0 +1,12 @@
+# Rust 构建产物
+/target
+
+# 构建/运行日志
+*.log
+build*.log
+
+# 服务端身份私钥（每个部署自行生成，不要提交共享）
+crosslink-server.key
+
+# 操作系统杂项
+.DS_Store

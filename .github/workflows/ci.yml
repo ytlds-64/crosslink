@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: info
+
+jobs:
+  build-and-smoke:
+    name: Build + smoke test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Smoke test — server + client over loopback
+        shell: bash
+        run: |
+          set -u
+          BIN=./target/release/crosslink
+          SRV=srv.log
+          CLI=cli.log
+          : > "$SRV"
+          : > "$CLI"
+
+          RUST_LOG=info "$BIN" --server --port 4242 --name srv > "$SRV" 2>&1 &
+          SRVPID=$!
+          RUST_LOG=info "$BIN" --client 127.0.0.1 --port 4242 --name cli > "$CLI" 2>&1 &
+          CLIPID=$!
+
+          sleep 6
+          pkill -f crosslink || true
+          wait || true
+
+          echo "----- server log -----"
+          cat "$SRV"
+          echo "----- client log -----"
+          cat "$CLI"
+
+          # 断言：握手完成 + 至少一次心跳回执
+          grep -q "handshake complete" "$SRV" || { echo "FAIL: no handshake on server"; exit 1; }
+          grep -q "heartbeat ack"      "$CLI" || { echo "FAIL: no heartbeat ack on client"; exit 1; }
+          echo "SMOKE TEST PASSED"
