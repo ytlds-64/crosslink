@@ -68,6 +68,7 @@ async fn session_server(
     test_input: bool,
 ) -> Result<()> {
     let (crypter, _fp) = crypto::server_handshake(&mut stream, key).await?;
+    log::info!("handshake complete");
     let (mut rd, wr) = split(stream);
     let wr = Arc::new(Mutex::new(wr));
     let crypter = Arc::new(Mutex::new(crypter));
@@ -156,7 +157,7 @@ async fn session_server(
             // 接收对端消息
             res = recv_msg(&mut rd, &crypter) => {
                 match res {
-                    Ok(msg) => handle(msg).await?,
+                    Ok(msg) => handle(msg, &wr, &crypter).await?,
                     Err(e) => {
                         log::error!("recv error: {:?}", e);
                         break;
@@ -222,7 +223,7 @@ async fn session_client(
                                 }
                             }
                         }
-                        handle(msg).await?;
+                        handle(msg, &wr, &crypter).await?;
                     }
                     Err(e) => {
                         log::error!("recv error: {:?}", e);
@@ -267,11 +268,16 @@ fn bridge_tokio_to_inject(mut tokio_rx: mpsc::UnboundedReceiver<InputEvent>) {
     log::info!("inject worker: channel closed, stopping");
 }
 
-async fn handle(msg: Message) -> Result<()> {
+async fn handle(
+    msg: Message,
+    wr: &Arc<Mutex<WriteHalf<TcpStream>>>,
+    crypter: &Arc<Mutex<Crypter>>,
+) -> Result<()> {
     match msg {
         Message::Heartbeat { t } => {
-            log::debug!("heartbeat: ignoring send-back (server side)");
-            let _ = t;
+            // 收到对端心跳 → 回 HeartbeatAck（对端据此测量 RTT）。
+            log::debug!("heartbeat received, acking");
+            send_msg(wr, crypter, &Message::HeartbeatAck { t }).await?;
         }
         Message::HeartbeatAck { t } => {
             log::info!("heartbeat ack, rtt = {} ms", now_ms().saturating_sub(t));
