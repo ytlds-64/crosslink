@@ -41,6 +41,21 @@ struct Cli {
     /// Bind address for the server
     #[arg(long, default_value = "0.0.0.0")]
     bind: String,
+
+    /// Disable keyboard capture on the server (server still accepts Input messages
+    /// from peer, but won't send its own local keystrokes).
+    #[arg(long)]
+    no_capture: bool,
+
+    /// Disable keyboard injection on the client (client still forwards received
+    /// Input events, but won't call SendInput locally).
+    #[arg(long)]
+    no_inject: bool,
+
+    /// Server: send 5 mock key events 500ms after handshake (for end-to-end
+    /// pipeline testing in sandbox/CI without real keypress).
+    #[arg(long)]
+    test_input: bool,
 }
 
 #[tokio::main]
@@ -57,15 +72,15 @@ async fn main() -> Result<()> {
             log::info!("=== Server identity fingerprint (share this with clients) ===");
             log::info!("    {}", fp);
             log::info!("===========================================================");
-            transport::run_server(&cli.bind, cli.port, &key, &cli.name).await?;
+            transport::run_server(&cli.bind, cli.port, &key, &cli.name, !cli.no_capture, cli.test_input).await?;
         }
         (false, Some(addr)) => {
-            transport::run_client(&addr, cli.port, cli.fingerprint.as_deref(), &cli.name).await?;
+            transport::run_client(&addr, cli.port, cli.fingerprint.as_deref(), &cli.name, !cli.no_inject).await?;
         }
         (false, None) => {
             eprintln!("Usage:");
-            eprintln!("  crosslink --server");
-            eprintln!("  crosslink --client <ADDR> [--fingerprint <FP>] [--port 4242]");
+            eprintln!("  crosslink --server [--no-capture]");
+            eprintln!("  crosslink --client <ADDR> [--fingerprint <FP>] [--port 4242] [--no-inject]");
             std::process::exit(2);
         }
     }

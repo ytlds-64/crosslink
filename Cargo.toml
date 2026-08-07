@@ -22,3 +22,12 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 rand = "0.8"
+
+# 平台 API：M2 输入捕获（GetAsyncKeyState）与注入（SendInput）。
+# windows crate 0.58 把这些 API 放在 Win32_UI_Input_KeyboardAndMouse 模块下。
+# 在 gnu 目标下也用 windows-targets 提供的 stub .lib，无需 msvc。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
