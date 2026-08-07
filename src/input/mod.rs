@@ -2,7 +2,7 @@
 //!
 //! - Windows：M2.2 键盘 + M2.3 鼠标，基于 `GetAsyncKeyState` / `GetCursorPos` 捕获
 //!   与 `SendInput` 注入。
-//! - macOS：M2.4 计划用 Core Graphics `CGEventTap` 捕获 + `CGEvent` 注入。
+//! - macOS：M2.4 基于 Core Graphics `CGEventTap` 捕获 + `CGEvent` 注入（需 TCC 授权）。
 //! - 其它平台（含 Linux CI 构建）：提供 no-op 实现，保证 `cargo build` 通过，
 //!   运行时不做任何输入转发（冒烟测试仅验证连通性与心跳）。
 
@@ -31,7 +31,7 @@ pub mod capture {
 #[cfg(target_os = "macos")]
 pub mod inject {
     pub mod macos;
-    pub use macos::inject as inject_event;
+    pub use macos::inject_event;
 }
 
 // 非 Windows / 非 macOS 平台：no-op 实现，保证可编译与可被冒烟测试链接。

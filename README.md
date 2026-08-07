@@ -2,8 +2,8 @@
 
 用一套鼠标 + 键盘无缝操控 **Windows** 与 **macOS**（Universal Control 式：光标越过屏幕边缘切到另一台，同一时刻只控制一台）。
 
-> 当前进度：**M1 ✅ + M2.2 ✅ + M2.3 ✅**（M1 加密传输骨架；M2.2 Windows 单向键盘；M2.3 Windows 鼠标：捕获→加密 wire→注入）。
-> 边缘切换 / macOS 端在后续里程碑（**M2.4**+）实现。
+> 当前进度：**M1 ✅ + M2.2 ✅ + M2.3 ✅ + M2.4 ✅**（M1 加密传输骨架；M2.2 Windows 单向键盘；M2.3 Windows 鼠标；M2.4 macOS 捕获/注入代码完成，待真机授权验证）。
+> 边缘切换（**M3**+）尚未实现。
 
 ---
 
@@ -138,6 +138,23 @@ inject: mouse button Left Released
 
 > 注：M2.3 仍**无条件转发**所有鼠标事件（屏幕边缘切换逻辑在 M3 才加入）。真实使用时请注意：服务端捕获的鼠标位移会被注入到客户端，因此在边缘切换落地前，仅建议在测试/受控环境下运行。
 
+### M2.4 端到端（macOS）
+
+与 Windows 端对称：服务端（持有物理键鼠的 Mac）用 `CGEventTap` 捕获键盘/鼠标，客户端 Mac 用 `CGEventPost` 注入。
+
+```bash
+# 1) 首次运行前，在「系统设置 → 隐私与安全性 → 辅助功能 / 输入监控」中
+#    把 crosslink 加入授权列表（CGEventTap 必需，否则 tap 创建失败）。
+
+# 终端 A —— 服务端（Mac，持有物理键鼠）
+cargo run -- --server --name mac-srv
+
+# 终端 B —— 客户端（另一台 Mac）
+cargo run -- --client <SERVER_IP> --fingerprint <FP> --name mac-cli
+```
+
+捕获端行为：键盘（含修饰键的 `FlagsChanged` 对比推断按下/释放）、鼠标按键与**相对位移**均经加密通道转发；注入端用 `CGEventPost`(HID) 重建事件，相对位移累积为本地绝对坐标。
+
 非 Windows / 非 macOS 平台（如 CI 的 Linux 构建）提供 no-op 输入后端，`cargo build` 可正常通过，但运行时不做任何转发（冒烟测试仅验证连通性与心跳）。
 
 ---
@@ -147,7 +164,7 @@ inject: mouse button Left Released
 - **M1** ✅：传输骨架 — TCP 连通 + 加密握手 + 心跳
 - **M2.2** ✅：Windows 单向键盘 — `GetAsyncKeyState` 捕获 + `SendInput` 注入 + HID 键码（**本机 Win 端到端验证通过**）
 - **M2.3** ✅：Windows 鼠标 — `GetCursorPos` 相对位移 + `GetAsyncKeyState` 按键 + `SendInput` 注入（**本机 Win 端到端验证通过**，含 `--test-input` 鼠标 mock）
-- **M2.4**（进行中）：macOS 端到端 — `CGEventTap` / `CGEventPost`（需辅助功能权限）
+- **M2.4** ✅：macOS 捕获/注入 — `CGEventTap`（捕获）+ `CGEventPost`（注入），修饰键用 FlagsChanged 对比推断；代码完成并通过两个 macOS 目标类型检查，待真机 TCC 授权后冒烟验证（详见下方「macOS 端」）。
 - **M3**：边缘切换 — 屏幕几何 + 光标越界接管 + 反向回切
 - **M4**：发现 / 配置 / GUI — mDNS、指纹授权、设置界面
 - **M5**：增强 — 剪贴板共享、文件拖拽、加密加固、打包发布
@@ -156,6 +173,7 @@ inject: mouse button Left Released
 
 ## 已知限制
 
-- M2.2 当前为**单向 Windows 键盘**（Server → Client），鼠标 / 边缘切换 / macOS 端尚未实现。
+- M2.2/M2.3 当前为**单向 Windows 键鼠**（Server → Client）；M2.4 macOS 捕获/注入代码已完成（类型检查通过，待真机授权验证），与 Windows 端链路对称。
+- macOS 端需在「系统设置 → 隐私与安全性 → 辅助功能 / 输入监控」中授权本程序；未授权时 `CGEventTapCreate` 返回 NULL，程序仅 log 错误且不捕获/注入。
 - GetAsyncKeyState 方案：foreground 切换时偶发滞后（约一个 5ms 轮询周期）。后续升级为 Raw Input（消息循环 + MakeCode 区分左右修饰键）以获得更好游戏兼容性。
 - 加密采用 Noise 式 X25519+AES-GCM 自研握手（非完整 TLS），安全性依赖于指纹 pinning 的正确使用。

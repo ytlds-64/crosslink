@@ -32,3 +32,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# macOS 输入捕获 / 注入（CGEventTap / CGEventPost）。仅 macOS 目标编译，不影响 Win/Linux。
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.22"
+core-foundation = "0.9"
