@@ -2,7 +2,7 @@
 
 用一套鼠标 + 键盘无缝操控 **Windows** 与 **macOS**（Universal Control 式：光标越过屏幕边缘切到另一台，同一时刻只控制一台）。
 
-> 当前进度：**M1 ✅ + M2.2 ✅ + M2.3 ✅ + M2.4 ✅**（M1 加密传输骨架；M2.2 Windows 单向键盘；M2.3 Windows 鼠标；M2.4 macOS 捕获/注入代码完成，待真机授权验证）。
+> 当前进度：**M1 ✅ + M2.2 ✅ + M2.3 ✅ + M2.4 ✅**（M1 加密传输骨架；M2.2 Windows 单向键盘；M2.3 Windows 鼠标；M2.4 macOS 捕获/注入，**已在 macOS Tahoe 真机验证通过**）。
 > 边缘切换（**M3**+）尚未实现。
 
 ---
@@ -138,24 +138,35 @@ inject: mouse button Left Released
 
 > 注：M2.3 仍**无条件转发**所有鼠标事件（屏幕边缘切换逻辑在 M3 才加入）。真实使用时请注意：服务端捕获的鼠标位移会被注入到客户端，因此在边缘切换落地前，仅建议在测试/受控环境下运行。
 
-### M2.4 端到端（macOS）
+### M2.4 端到端（macOS）— 已真机验证通过 ✅
 
 与 Windows 端对称：服务端（持有物理键鼠的 Mac）用 `CGEventTap` 捕获键盘/鼠标，客户端 Mac 用 `CGEventPost` 注入。
 
-```bash
-# 1) 首次运行前，在「系统设置 → 隐私与安全性 → 辅助功能 / 输入监控」中
-#    把 crosslink 加入授权列表（CGEventTap 必需，否则 tap 创建失败）。
+> ⚠️ **macOS Tahoe 关键坑**：裸 `cargo build --release` 产出的二进制在 Tahoe 上 **`CGEventTap` 拿不到稳定的「辅助功能」授权**（输入监控 OK，但辅助功能会失效 / 不持久）。
+> **解决：必须打包成 `.app` bundle 并固定 `CFBundleIdentifier`**，TCC 才会稳定授权。一键打包脚本见 `tools/mac-bundle.sh`：
+>
+> ```bash
+> zsh tools/mac-bundle.sh          # 在 Mac 上执行，产出 dist/crosslink.app
+> ```
+>
+> 然后把 **`crosslink.app` 本体**（不是里面的二进制）加入：
+> 系统设置 → 隐私与安全性 → **辅助功能** + **输入监控**，并勾选。
 
-# 终端 A —— 服务端（Mac，持有物理键鼠）
-cargo run -- --server --name mac-srv
+```bash
+# 终端 A —— 服务端（Mac，持有物理键鼠；用 .app 内二进制）
+dist/crosslink.app/Contents/MacOS/crosslink --server --name mac-srv
 
 # 终端 B —— 客户端（另一台 Mac）
-cargo run -- --client <SERVER_IP> --fingerprint <FP> --name mac-cli
+dist/crosslink.app/Contents/MacOS/crosslink --client <SERVER_IP> --name mac-cli
 ```
 
 捕获端行为：键盘（含修饰键的 `FlagsChanged` 对比推断按下/释放）、鼠标按键与**相对位移**均经加密通道转发；注入端用 `CGEventPost`(HID) 重建事件，相对位移累积为本地绝对坐标。
 
+> ⚠️ **禁止同机同时跑 server + client（标准 inject 模式）**：会产生输入回环风暴（捕获→注入→再捕获→无限放大），导致鼠标键盘失控。验证脚本 `tools/crosslink-verify.sh`（Mac）/ `tools/win-verify.ps1`（Windows）用 `--no-capture` / `--no-inject` 切断回环；**真正的端到端联动必须在两台不同机器上进行**。
+
 非 Windows / 非 macOS 平台（如 CI 的 Linux 构建）提供 no-op 输入后端，`cargo build` 可正常通过，但运行时不做任何转发（冒烟测试仅验证连通性与心跳）。
+
+> 🔐 **密钥安全**：服务端身份私钥 `crosslink-server.key` 已写入 `.gitignore` 且**绝不可提交 / 明文分享**（详见仓库根目录 `SECURITY.md`）。
 
 ---
 
@@ -164,7 +175,7 @@ cargo run -- --client <SERVER_IP> --fingerprint <FP> --name mac-cli
 - **M1** ✅：传输骨架 — TCP 连通 + 加密握手 + 心跳
 - **M2.2** ✅：Windows 单向键盘 — `GetAsyncKeyState` 捕获 + `SendInput` 注入 + HID 键码（**本机 Win 端到端验证通过**）
 - **M2.3** ✅：Windows 鼠标 — `GetCursorPos` 相对位移 + `GetAsyncKeyState` 按键 + `SendInput` 注入（**本机 Win 端到端验证通过**，含 `--test-input` 鼠标 mock）
-- **M2.4** ✅：macOS 捕获/注入 — `CGEventTap`（捕获）+ `CGEventPost`（注入），修饰键用 FlagsChanged 对比推断；代码完成并通过两个 macOS 目标类型检查，待真机 TCC 授权后冒烟验证（详见下方「macOS 端」）。
+- **M2.4** ✅：macOS 捕获/注入 — `CGEventTap`（捕获）+ `CGEventPost`（注入），修饰键用 FlagsChanged 对比推断；代码完成并通过两个 macOS 目标类型检查，**已在 macOS Tahoe 真机验证通过**（必须 `.app` bundle + TCC 双重授权，详见下方「macOS 端」与 `tools/mac-bundle.sh`）。
 - **M3**：边缘切换 — 屏幕几何 + 光标越界接管 + 反向回切
 - **M4**：发现 / 配置 / GUI — mDNS、指纹授权、设置界面
 - **M5**：增强 — 剪贴板共享、文件拖拽、加密加固、打包发布
