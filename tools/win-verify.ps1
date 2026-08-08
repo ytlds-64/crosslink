@@ -1,8 +1,7 @@
-# crosslink Windows verification script (PS 5.1-friendly).
-# Uses [System.Diagnostics.ProcessStartInfo] directly to launch crosslink.
-# Avoids the Start-Process + cmd.exe /c + embedded-quotes param-eating bug
-# that ate our --server/--client args (everything got stripped, only clap's
-# Usage block landed in the log).
+# crosslink Windows verification script (PS 5.1-friendly, Start-Process variant).
+# Uses Start-Process -ArgumentList <array> directly. Each ArgArray element
+# becomes one argv entry to crosslink.exe - no shell-style repassing, no
+# embedded-quote arg-eating.
 # Run as Administrator if you want SendInput to land on UAC-elevated windows.
 
 $ErrorActionPreference = "Continue"
@@ -21,44 +20,43 @@ foreach ($c in $candidates) {
     if (Test-Path $c) { $bin = (Resolve-Path $c).Path; break }
 }
 if (-not $bin) {
-    Write-Error "[ERR] crosslink.exe not found. Build first (cargo build --release)."
+    Write-Error "[ERR] crosslink.exe not found. Build first (cargo build --release) and cd into the crosslink repo root before running this script."
     exit 1
 }
 Write-Host "Using binary: $bin"
 
 # ---- Pre-clean ----
-foreach ($f in @(".\srv_inject.log",".\cli_inject.log",".\srv_cap.log",".\cli_cap.log")) {
+$cleanFiles = @(
+    ".\srv_inject.log",".\cli_inject.log",".\srv_cap.log",".\cli_cap.log",
+    ".\srv_inject.log.out",".\srv_inject.log.err",
+    ".\cli_inject.log.out",".\cli_inject.log.err",
+    ".\srv_cap.log.out",".\srv_cap.log.err",
+    ".\cli_cap.log.out",".\cli_cap.log.err"
+)
+foreach ($f in $cleanFiles) {
     if (Test-Path $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
 }
 Get-Process crosslink -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 
-# ---- Helper: launch crosslink via .NET ProcessStartInfo, async-capture streams ----
+# ---- Helper: launch crosslink via Start-Process -ArgumentList <array> ----
 function Start-Xlink {
     param([string[]]$ArgArray, [string]$LogPath)
-    if (Test-Path $LogPath) { Remove-Item -LiteralPath $LogPath -Force }
 
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $bin
-    $psi.Arguments = ($ArgArray | ForEach-Object {
-            if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ }
-        }) -join ' '
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.WorkingDirectory = (Get-Location).Path
+    Write-Host ("  argv: " + ($ArgArray -join ' '))
 
-    $proc = [System.Diagnostics.Process]::Start($psi)
+    $proc = Start-Process `
+        -FilePath $bin `
+        -ArgumentList $ArgArray `
+        -NoNewWindow `
+        -PassThru `
+        -RedirectStandardOutput ("$LogPath.out") `
+        -RedirectStandardError  ("$LogPath.err")
 
-    # Async reads so the child never blocks on a full pipe buffer
-    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
-    $stderrTask = $proc.StandardError.ReadToEndAsync()
-
-    return @{ Proc = $proc; StdoutTask = $stdoutTask; StderrTask = $stderrTask; LogPath = $LogPath }
+    return @{ Proc = $proc; LogPath = $LogPath }
 }
 
-# ---- Helper: stop process, write merged log ----
+# ---- Helper: stop process, merge .out/.err into LogPath ----
 function Stop-Xlink {
     param($Runner)
     Start-Sleep -Milliseconds 500
@@ -66,15 +64,18 @@ function Stop-Xlink {
         try { $Runner.Proc.Kill() } catch {}
     }
     $Runner.Proc.WaitForExit(3000) | Out-Null
+
     $stdout = ""
     $stderr = ""
-    try { $stdout = $Runner.StdoutTask.Result } catch {}
-    try { $stderr = $Runner.StderrTask.Result } catch {}
-    $content = $stdout + "`n" + $stderr
-    [System.IO.File]::WriteAllText($Runner.LogPath, $content, [System.Text.Encoding]::UTF8)
+    if (Test-Path "$($Runner.LogPath).out") { $stdout = (Get-Content "$($Runner.LogPath).out" -Raw -ErrorAction SilentlyContinue) }
+    if (Test-Path "$($Runner.LogPath).err") { $stderr = (Get-Content "$($Runner.LogPath).err" -Raw -ErrorAction SilentlyContinue) }
+
+    [System.IO.File]::WriteAllText($Runner.LogPath, ($stdout + "`n" + $stderr), [System.Text.Encoding]::UTF8)
+
+    Remove-Item "$($Runner.LogPath).out","$($Runner.LogPath).err" -Force -ErrorAction SilentlyContinue
 }
 
-# ---- Pick two random ports (avoid common defaults) ----
+# ---- Pick two random ports ----
 $port1 = Get-Random -Minimum 4244 -Maximum 8999
 $port2 = $port1 + 1
 
