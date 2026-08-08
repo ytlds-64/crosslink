@@ -31,12 +31,16 @@ foreach ($f in @("srv_inject.log","cli_inject.log","srv_cap.log","cli_cap.log"))
     Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue
 }
 
-# Run the .bat launcher (does all process orchestration)
+# Run the .bat launcher (does all process orchestration).
+# IMPORTANT: do NOT pass Arguments as an array - PowerShell 5.1 + Start-Process
+# has quoting bugs with paths containing spaces. Build ONE cmd /c string instead,
+# which lets cmd itself handle the parsing.
 Write-Host ""
 Write-Host "===== Running launcher (server + client pairs) ====="
 $port1 = Get-Random -Minimum 4244 -Maximum 9000
 $port2 = $port1 + 1
-$proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "`"$launcher`" `"$bindir`" $port1 $port2" -NoNewWindow -Wait -PassThru
+$cmdLine = '/c ""' + $launcher + '" "' + $bindir + '" ' + $port1 + ' ' + $port2 + '"'
+$proc = Start-Process -FilePath "cmd.exe" -ArgumentList $cmdLine -NoNewWindow -Wait -PassThru
 Write-Host "Launcher exited with code: $($proc.ExitCode)"
 
 Start-Sleep -Seconds 1
