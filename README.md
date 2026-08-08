@@ -2,8 +2,8 @@
 
 用一套鼠标 + 键盘无缝操控 **Windows** 与 **macOS**（Universal Control 式：光标越过屏幕边缘切到另一台，同一时刻只控制一台）。
 
-> 当前进度：**M1 ✅ + M2.2 ✅ + M2.3 ✅ + M2.4 ✅**（M1 加密传输骨架；M2.2 Windows 单向键盘；M2.3 Windows 鼠标；M2.4 macOS 捕获/注入，**已在 macOS Tahoe 真机验证通过**）。
-> 边缘切换（**M3**+）尚未实现。
+> 当前进度：**M1 ✅ + M2.2 ✅ + M2.3 ✅ + M2.4 ✅ + M3 ✅**（M1 加密传输骨架；M2.2 Windows 单向键盘；M2.3 Windows 鼠标；M2.4 macOS 捕获/注入，**已在 macOS Tahoe 真机验证通过**；M3 边缘切换 / 指针漫游已实现）。
+> 边缘切换（**M3**）已落地：双机指针漫游（Universal Control 式）。
 
 ---
 
@@ -170,13 +170,65 @@ dist/crosslink.app/Contents/MacOS/crosslink --client <SERVER_IP> --name mac-cli
 
 ---
 
+## M3 端到端（边缘切换 / 指针漫游）— Universal Control 式 ✅
+
+M3 让指针在双机之间「漫游」：任一时刻指针只属于一台机器（owner），owner 用本机物理键鼠**原生**操作本机；当 owner 把光标推到与对端共享的「接缝边」时，指针立即「交给」对端（对端在其接缝边对应位置落下光标并接管）。非 owner 一方光标停在接缝边、忽略本地输入。**稳态下不转发任何鼠标/键盘**——只交换极小的 `Transfer` 消息，彻底绕开跨平台「输入抑制」难题，也契合「同时只控一台」。
+
+> ⚠️ 与 M2 的区别：M2 是「服务端单向转发键鼠到客户端」；M3 是「双机各自用各自物理键鼠，指针在屏幕间漫游」。两者互斥：`--switch` 开启 M3，否则走 M2 转发（**默认仍是 M2，向后兼容**）。
+
+拓扑（默认水平拼接）：
+
+```
+┌─────────────┐   seam (右边缘)    ┌─────────────┐
+│  Server 端   │ ─────────────────→│  Client 端   │
+│ (初始 owner) │  指针在此越过边界   │ (初始待命)   │
+└─────────────┘                    └─────────────┘
+   --side right (默认)              --side left  (默认)
+```
+
+运行（两台**不同**机器，A 服务端 / B 客户端）：
+
+```bash
+# 机器 A（服务端，初始持有指针）—— Windows
+cargo run --target x86_64-pc-windows-gnu -- --server --switch --name pc-a
+# 机器 B（客户端，待命接指针）—— Windows
+cargo run --target x86_64-pc-windows-gnu -- --client <A的IP> --switch --name pc-b
+
+# macOS 端用 .app 内二进制（见 M2.4 的 .app 授权说明）
+dist/crosslink.app/Contents/MacOS/crosslink --server --switch --name mac-a
+dist/crosslink.app/Contents/MacOS/crosslink --client <A的IP> --switch --name mac-b
+```
+
+行为：
+1. 启动后 A 持有指针，正常用 A 的键鼠；B 的光标停在屏幕接缝边（默认左边缘中点）。
+2. 在 A 上把光标推到右边缘 → 指针「跳」到 B 的左边缘对应位置，B 变身 owner，用 B 的键鼠。
+3. 在 B 上把光标推回左边缘 → 指针交还给 A。如此往复。
+4. 两端分辨率不同时，y（或 x）按双方分辨率比例映射，落点不会跑偏。
+
+布局微调：默认 server=右 / client=左（水平拼接）。若物理摆放是上下或左右相反，**两端用 `--side` 一致声明对端位置**即可（`right` / `left` / `top` / `bottom`）。例如 server 在左、client 在右：server 加 `--side left`，client 加 `--side right`。
+
+> 真机双机联动需放行防火墙（服务端）：`netsh advfirewall firewall add rule name=crosslink dir=in action=allow protocol=TCP localport=4242`（端口按实际 `--port`）。
+> macOS 端 M3 同样需要 `.app` + 「辅助功能 / 输入监控」授权（`set_cursor_pos` 用的 `CGWarpMouseCursorPosition` 也受 TCC 约束）。
+
+### 单机自测（Windows，无需第二台机器）
+
+`tools/win-verify.ps1` 新增 **Test 3**：本机 loopback 起 `--switch` 的服务端 + 客户端，验证双方监控线程启动、并交换屏幕几何（即 M3 协议接线正确）。真实「光标越界移交」仍需两台带显示器的机器手动验证。
+
+```powershell
+cd C:\Users\xiao\crosslink
+powershell -ExecutionPolicy Bypass -File .\tools\win-verify.ps1
+# 期望：injection: OK / capture: OK / switch: OK
+```
+
+---
+
 ## 路线图
 
 - **M1** ✅：传输骨架 — TCP 连通 + 加密握手 + 心跳
 - **M2.2** ✅：Windows 单向键盘 — `GetAsyncKeyState` 捕获 + `SendInput` 注入 + HID 键码（**本机 Win 端到端验证通过**）
 - **M2.3** ✅：Windows 鼠标 — `GetCursorPos` 相对位移 + `GetAsyncKeyState` 按键 + `SendInput` 注入（**本机 Win 端到端验证通过**，含 `--test-input` 鼠标 mock）
 - **M2.4** ✅：macOS 捕获/注入 — `CGEventTap`（捕获）+ `CGEventPost`（注入），修饰键用 FlagsChanged 对比推断；代码完成并通过两个 macOS 目标类型检查，**已在 macOS Tahoe 真机验证通过**（必须 `.app` bundle + TCC 双重授权，详见下方「macOS 端」与 `tools/mac-bundle.sh`）。
-- **M3**：边缘切换 — 屏幕几何 + 光标越界接管 + 反向回切
+- **M3** ✅：边缘切换 / 指针漫游（Universal Control 式）— 屏幕几何交换 + 接缝边检测 + 指针跨机移交 + 反向回切（对称 ownership 模型，稳态不转发输入，仅交换极小 `Transfer` 消息）。`--switch` 开启，默认仍走 M2 转发（向后兼容）。
 - **M4**：发现 / 配置 / GUI — mDNS、指纹授权、设置界面
 - **M5**：增强 — 剪贴板共享、文件拖拽、加密加固、打包发布
 
@@ -184,7 +236,7 @@ dist/crosslink.app/Contents/MacOS/crosslink --client <SERVER_IP> --name mac-cli
 
 ## 已知限制
 
-- M2.2/M2.3 当前为**单向 Windows 键鼠**（Server → Client）；M2.4 macOS 捕获/注入代码已完成（类型检查通过，待真机授权验证），与 Windows 端链路对称。
+- M2.2/M2.3 当前为**单向 Windows 键鼠**（Server → Client）；M2.4 macOS 捕获/注入代码已完成（类型检查通过，已在 macOS Tahoe 真机验证通过），与 Windows 端链路对称。M3 边缘切换已实现：双机指针漫游（对称 ownership 模型，`--switch` 开启）。
 - macOS 端需在「系统设置 → 隐私与安全性 → 辅助功能 / 输入监控」中授权本程序；未授权时 `CGEventTapCreate` 返回 NULL，程序仅 log 错误且不捕获/注入。
 - GetAsyncKeyState 方案：foreground 切换时偶发滞后（约一个 5ms 轮询周期）。后续升级为 Raw Input（消息循环 + MakeCode 区分左右修饰键）以获得更好游戏兼容性。
 - 加密采用 Noise 式 X25519+AES-GCM 自研握手（非完整 TLS），安全性依赖于指纹 pinning 的正确使用。
