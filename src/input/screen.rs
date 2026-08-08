@@ -39,8 +39,6 @@ mod imp {
 #[cfg(target_os = "macos")]
 mod imp {
     use core_graphics::display::CGDisplay;
-    use core_graphics::event::CGEvent;
-    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use core_graphics::geometry::CGPoint;
 
     pub fn screen_size() -> (u32, u32) {
@@ -50,16 +48,27 @@ mod imp {
     }
 
     pub fn get_cursor_pos() -> (i32, i32) {
-        let src = match CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
-            Ok(s) => s,
-            Err(_) => return (0, 0),
-        };
-        match CGEvent::new(src) {
-            Ok(e) => {
-                let p = e.location();
-                (p.x as i32, p.y as i32)
+        // 关键：core-graphics 0.22 没有 `CGEvent::mouseLocation()` 静态方法。
+        // `CGEvent::new(source)` 强制要 source，源码注释也写明返回的是「新事件，
+        // 默认 location (0, 0)」——所以之前用它读到的一直是 (0, 0)，Mac 监控线程
+        // 永远不解锁 armed，M3 真机只能往返一次。
+        //
+        // 正确做法：直接调 C API `CGEventCreate(NULL)`，传 NULL 时 CoreGraphics
+        // 会捕获**当前系统状态**，事件里的 location 就是真实光标位置。
+        extern "C" {
+            fn CGEventCreate(source: *const std::ffi::c_void) -> *const std::ffi::c_void;
+            fn CGEventGetLocation(event: *const std::ffi::c_void) -> CGPoint;
+            fn CFRelease(cf: *const std::ffi::c_void);
+        }
+        unsafe {
+            let event = CGEventCreate(std::ptr::null());
+            if event.is_null() {
+                return (0, 0);
             }
-            Err(_) => (0, 0),
+            let p = CGEventGetLocation(event);
+            // CGEventCreate 返回的是 +1 retain，必须手动释放。
+            CFRelease(event);
+            (p.x as i32, p.y as i32)
         }
     }
 
