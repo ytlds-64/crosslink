@@ -98,6 +98,17 @@ Start-Sleep -Seconds 6
 Stop-Xlink $T2Srv
 Stop-Xlink $T2Cli
 
+# ---- Test 3: M3 edge-switch wiring (loopback; no real cursor move needed) ----
+$port3 = $port2 + 1
+Write-Host ""
+Write-Host "===== Test 3: Edge-switch wiring (--switch loopback) ====="
+$T3Srv = Start-Xlink @('--server','--switch','--port',"$port3",'--name','srv-sw') ".\srv_sw.log"
+Start-Sleep -Seconds 3
+$T3Cli = Start-Xlink @('--client','127.0.0.1','--port',"$port3",'--switch','--name','cli-sw') ".\cli_sw.log"
+Start-Sleep -Seconds 5
+Stop-Xlink $T3Srv
+Stop-Xlink $T3Cli
+
 # ---- Inspect logs ----
 function Read-Log {
     param([string]$Path)
@@ -142,10 +153,29 @@ if ([string]::IsNullOrWhiteSpace($srv2log)) {
 }
 
 Write-Host ""
+$srv3log = Read-Log ".\srv_sw.log"
+$cli3log = Read-Log ".\cli_sw.log"
+if ([string]::IsNullOrWhiteSpace($srv3log) -or [string]::IsNullOrWhiteSpace($cli3log)) {
+    Write-Host "[FAIL] switch: srv_sw.log or cli_sw.log empty/missing"
+    $switchRes = "FAIL"
+} elseif (($srv3log -match '(?m)^\s*Usage:') -or ($cli3log -match '(?m)^\s*Usage:')) {
+    Write-Host "[FAIL] switch: a side printed Usage only (args not delivered)"
+    $switchRes = "FAIL"
+} elseif (($srv3log -match 'switch monitor starting') -and ($cli3log -match 'switch monitor starting') -and ($srv3log -match 'peer screen geometry') -and ($cli3log -match 'peer screen geometry')) {
+    Write-Host "[OK]   switch: both sides booted monitor + exchanged screen geometry"
+    $switchRes = "OK"
+} else {
+    Write-Host "[WARN] switch: booted but monitor/geometry handshake not fully seen"
+    $switchRes = "WARN"
+}
+
 Write-Host "===== Summary ====="
 Write-Host "injection: $injection"
 Write-Host "capture:   $capture"
+Write-Host "switch:    $switchRes"
 Write-Host ""
-Write-Host "Logs (working dir): srv_inject.log, cli_inject.log, srv_cap.log, cli_cap.log"
-Write-Host "Real cross-machine E2E requires TWO machines + this firewall rule on server:"
+Write-Host "Logs (working dir): srv_inject.log, cli_inject.log, srv_cap.log, cli_cap.log, srv_sw.log, cli_sw.log"
+Write-Host "Real cross-machine E2E (cursor handoff) requires TWO machines + this firewall rule on server:"
 Write-Host "    netsh advfirewall firewall add rule name=crosslink dir=in action=allow protocol=TCP localport=$port1"
+Write-Host "For --switch cursor roaming: run server with --switch on machine A, client with --switch on"
+Write-Host "machine B; push the cursor to the shared edge to hand off. Tune --side if layout isn't left/right."

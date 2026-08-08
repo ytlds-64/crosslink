@@ -8,6 +8,7 @@
 
 pub mod event;
 pub mod keycodes;
+pub mod screen;
 
 #[cfg(target_os = "windows")]
 pub mod capture {

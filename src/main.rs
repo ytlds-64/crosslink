@@ -1,13 +1,15 @@
 mod input;
 mod net;
+mod switch;
 
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use net::crypto;
 use net::transport;
+use switch::Side;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -56,6 +58,38 @@ struct Cli {
     /// pipeline testing in sandbox/CI without real keypress).
     #[arg(long)]
     test_input: bool,
+
+    /// Enable edge-switching (Universal Control style): the pointer roams between
+    /// this machine and the peer; only the machine currently under the pointer is
+    /// controlled. Requires both ends to run --switch with consistent --side.
+    #[arg(long)]
+    switch: bool,
+
+    /// In --switch mode, where the peer machine sits relative to this one.
+    /// Defaults: server = right, client = left (a coherent horizontal layout).
+    /// Override on both ends consistently for other layouts.
+    #[arg(long, value_enum)]
+    side: Option<SideArg>,
+}
+
+/// CLI 侧 `--side` 取值（clap ValueEnum），运行时映射为 `switch::Side`。
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum SideArg {
+    Right,
+    Left,
+    Top,
+    Bottom,
+}
+
+impl From<SideArg> for Side {
+    fn from(s: SideArg) -> Self {
+        match s {
+            SideArg::Right => Side::Right,
+            SideArg::Left => Side::Left,
+            SideArg::Top => Side::Top,
+            SideArg::Bottom => Side::Bottom,
+        }
+    }
 }
 
 #[tokio::main]
@@ -63,6 +97,12 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
+
+    // --switch 模式下，对端相对本机的位置：服务端默认右、客户端默认左。
+    let side: Side = cli
+        .side
+        .map(Side::from)
+        .unwrap_or(if cli.server { Side::Right } else { Side::Left });
 
     match (cli.server, cli.client.clone()) {
         (true, _) => {
@@ -72,15 +112,34 @@ async fn main() -> Result<()> {
             log::info!("=== Server identity fingerprint (share this with clients) ===");
             log::info!("    {}", fp);
             log::info!("===========================================================");
-            transport::run_server(&cli.bind, cli.port, &key, &cli.name, !cli.no_capture, cli.test_input).await?;
+            transport::run_server(
+                &cli.bind,
+                cli.port,
+                &key,
+                &cli.name,
+                !cli.no_capture,
+                cli.test_input,
+                cli.switch,
+                side,
+            )
+            .await?;
         }
         (false, Some(addr)) => {
-            transport::run_client(&addr, cli.port, cli.fingerprint.as_deref(), &cli.name, !cli.no_inject).await?;
+            transport::run_client(
+                &addr,
+                cli.port,
+                cli.fingerprint.as_deref(),
+                &cli.name,
+                !cli.no_inject,
+                cli.switch,
+                side,
+            )
+            .await?;
         }
         (false, None) => {
             eprintln!("Usage:");
-            eprintln!("  crosslink --server [--no-capture]");
-            eprintln!("  crosslink --client <ADDR> [--fingerprint <FP>] [--port 4242] [--no-inject]");
+            eprintln!("  crosslink --server [--no-capture] [--switch [--side right|left|top|bottom]]");
+            eprintln!("  crosslink --client <ADDR> [--fingerprint <FP>] [--port 4242] [--no-inject] [--switch [--side ...]]");
             std::process::exit(2);
         }
     }

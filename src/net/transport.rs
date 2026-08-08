@@ -9,16 +9,21 @@ use tokio::time::interval;
 
 use crate::input;
 use crate::input::event::{InputEvent, KeyEvent, KeyState, MouseButton, MouseEvent};
+use crate::input::screen;
 use crate::net::crypto::{self, Crypter, StaticSecret};
-use crate::net::protocol::Message;
+use crate::net::protocol::{Message, Transfer};
+use crate::switch::{Side, Switch};
 
 /// 启动一个服务端会话：绑定端口、接受单连接、加密握手、进入会话循环。
 ///
 /// `enable_capture` 为 true 时，服务端会启动键盘捕获线程，将本地按键通过
-/// `Message::Input` 发送给对端（**单向：server → client**）。
+/// `Message::Input` 发送给对端（**单向：server → client**，M2 模式）。
 ///
 /// `test_input` 为 true 时，启动 500ms 后会发送一组 mock 键事件用于端到端链路
 /// 验证（无需真实按键——沙箱/CI 友好）。
+///
+/// `switch_mode` 为 true 时启用 M3 边缘切换：服务端初始持有指针，不再转发输入，
+/// 仅在对端接缝边时交换 `Transfer` 消息。
 pub async fn run_server(
     bind: &str,
     port: u16,
@@ -26,6 +31,8 @@ pub async fn run_server(
     name: &str,
     enable_capture: bool,
     test_input: bool,
+    switch_mode: bool,
+    side: Side,
 ) -> Result<()> {
     let listener = TcpListener::bind((bind, port))
         .await
@@ -35,7 +42,7 @@ pub async fn run_server(
     loop {
         let (stream, peer) = listener.accept().await?;
         log::info!("accepted connection from {}", peer);
-        if let Err(e) = session_server(stream, key, name, enable_capture, test_input).await {
+        if let Err(e) = session_server(stream, key, name, enable_capture, test_input, switch_mode, side).await {
             log::error!("session ended with error: {:?}", e);
         }
         log::info!("session closed, waiting for next connection");
@@ -45,19 +52,21 @@ pub async fn run_server(
 /// 启动一个客户端会话：连接、加密握手、进入会话循环。
 ///
 /// `enable_inject` 为 true 时，收到 `Message::Input` 会通过 `SendInput`
-/// 注入到本机键盘队列。
+/// 注入到本机键盘队列（M2 模式）。
 pub async fn run_client(
     addr: &str,
     port: u16,
     fingerprint: Option<&str>,
     name: &str,
     enable_inject: bool,
+    switch_mode: bool,
+    side: Side,
 ) -> Result<()> {
     let stream = TcpStream::connect((addr, port))
         .await
         .with_context(|| format!("connect {}:{}", addr, port))?;
     log::info!("connected to {}:{}", addr, port);
-    session_client(stream, fingerprint, name, enable_inject).await
+    session_client(stream, fingerprint, name, enable_inject, switch_mode, side).await
 }
 
 async fn session_server(
@@ -66,6 +75,8 @@ async fn session_server(
     name: &str,
     enable_capture: bool,
     test_input: bool,
+    switch_mode: bool,
+    side: Side,
 ) -> Result<()> {
     let (crypter, _fp) = crypto::server_handshake(&mut stream, key).await?;
     log::info!("handshake complete");
@@ -73,19 +84,34 @@ async fn session_server(
     let wr = Arc::new(Mutex::new(wr));
     let crypter = Arc::new(Mutex::new(crypter));
 
-    // 启动捕获桥：std mpsc (capture 线程) → tokio mpsc (async 任务)
+    // ---- 屏幕几何（用于 Hello 交换；M3 边缘切换需要）----
+    let (my_w, my_h) = screen::screen_size();
+
+    // ---- 边缘切换控制器（仅 switch 模式）----
+    let (sw_tx, mut sw_rx) = mpsc::unbounded_channel::<Transfer>();
+    let switch: Option<Switch> = if switch_mode {
+        let s = Switch::new(side, true, my_w, my_h, sw_tx);
+        s.start_monitor();
+        Some(s)
+    } else {
+        None
+    };
+
+    // ---- M2 捕获桥（仅非 switch 模式）----
     let (etx, mut erx) = mpsc::unbounded_channel::<InputEvent>();
-    if enable_capture {
+    if !switch_mode && enable_capture {
         let std_rx = input::capture::start_capture();
         let etx_c = etx.clone();
         tokio::task::spawn_blocking(move || bridge_capture_to_tokio(std_rx, etx_c));
         log::info!("server: keyboard+mouse capture → wire enabled");
+    } else if switch_mode {
+        log::info!("server: --switch mode (edge switching), capture disabled");
     } else {
         log::info!("server: capture disabled (--no-capture)");
     }
 
-    // 测试模式：注入 mock 事件验证端到端链路（沙箱/CI 友好）
-    if test_input {
+    // ---- 测试模式（仅非 switch 模式）----
+    if !switch_mode && test_input {
         let etx_test = etx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -134,12 +160,15 @@ async fn session_server(
             log::info!("test-input: sequence done");
         });
     }
+
     send_msg(
         &wr,
         &crypter,
         &Message::Hello {
             name: name.to_string(),
             platform: input::platform().to_string(),
+            screen_w: my_w,
+            screen_h: my_h,
         },
     )
     .await?;
@@ -147,17 +176,28 @@ async fn session_server(
     let mut hb = interval(Duration::from_secs(3));
     loop {
         tokio::select! {
-            // 捕获事件 → 发送到对端
-            Some(ev) = erx.recv() => {
+            // 捕获事件 → 发送到对端（M2 模式）
+            Some(ev) = erx.recv(), if switch.is_none() => {
                 if let Err(e) = send_msg(&wr, &crypter, &Message::Input(ev)).await {
                     log::error!("send input event error: {:?}", e);
+                    break;
+                }
+            }
+            // 边缘切换：本端触发穿越 → 加密送 Transfer（M3 模式）
+            Some(t) = sw_rx.recv(), if switch.is_some() => {
+                if let Err(e) = send_msg(&wr, &crypter, &Message::Transfer(t)).await {
+                    log::error!("send transfer error: {:?}", e);
                     break;
                 }
             }
             // 接收对端消息
             res = recv_msg(&mut rd, &crypter) => {
                 match res {
-                    Ok(msg) => handle(msg, &wr, &crypter).await?,
+                    Ok(msg) => {
+                        if !handle_msg(msg, &switch, &None, &wr, &crypter).await? {
+                            break;
+                        }
+                    }
                     Err(e) => {
                         log::error!("recv error: {:?}", e);
                         break;
@@ -182,6 +222,8 @@ async fn session_client(
     fingerprint: Option<&str>,
     name: &str,
     enable_inject: bool,
+    switch_mode: bool,
+    side: Side,
 ) -> Result<()> {
     let (crypter, fp) = crypto::client_handshake(&mut stream, fingerprint).await?;
     log::info!("handshake complete, server fingerprint = {}", fp);
@@ -189,14 +231,33 @@ async fn session_client(
     let wr = Arc::new(Mutex::new(wr));
     let crypter = Arc::new(Mutex::new(crypter));
 
-    // 启动注入 worker：从 tokio mpsc 拉事件，丢到 SendInput
-    let (itx, irx) = mpsc::unbounded_channel::<InputEvent>();
-    if enable_inject {
-        tokio::task::spawn_blocking(move || bridge_tokio_to_inject(irx));
-        log::info!("client: wire → SendInput inject enabled");
+    let (my_w, my_h) = screen::screen_size();
+
+    let (sw_tx, mut sw_rx) = mpsc::unbounded_channel::<Transfer>();
+    let switch: Option<Switch> = if switch_mode {
+        // 客户端初始不持有指针（服务端先持有）。
+        let s = Switch::new(side, false, my_w, my_h, sw_tx);
+        s.start_monitor();
+        Some(s)
     } else {
-        log::info!("client: inject disabled (--no-inject)");
-    }
+        None
+    };
+
+    // M2 注入 worker（仅非 switch 模式）。switch 模式下 itx 为 None，
+    // 收到的 Input 既不会被注入也不会被转发（指针由本地物理输入接管）。
+    let itx: Option<mpsc::UnboundedSender<InputEvent>> = if !switch_mode && enable_inject {
+        let (tx, rx) = mpsc::unbounded_channel::<InputEvent>();
+        tokio::task::spawn_blocking(move || bridge_tokio_to_inject(rx));
+        log::info!("client: wire → SendInput inject enabled");
+        Some(tx)
+    } else {
+        if switch_mode {
+            log::info!("client: --switch mode (edge switching), inject disabled");
+        } else {
+            log::info!("client: inject disabled (--no-inject)");
+        }
+        None
+    };
 
     send_msg(
         &wr,
@@ -204,6 +265,8 @@ async fn session_client(
         &Message::Hello {
             name: name.to_string(),
             platform: input::platform().to_string(),
+            screen_w: my_w,
+            screen_h: my_h,
         },
     )
     .await?;
@@ -211,19 +274,20 @@ async fn session_client(
     let mut hb = interval(Duration::from_secs(3));
     loop {
         tokio::select! {
+            // 边缘切换：本端触发穿越 → 加密送 Transfer（M3 模式）
+            Some(t) = sw_rx.recv(), if switch.is_some() => {
+                if let Err(e) = send_msg(&wr, &crypter, &Message::Transfer(t)).await {
+                    log::error!("send transfer error: {:?}", e);
+                    break;
+                }
+            }
             // 接收对端消息
             res = recv_msg(&mut rd, &crypter) => {
                 match res {
                     Ok(msg) => {
-                        // 把 Input 事件转发到 inject worker
-                        if let Message::Input(ev) = &msg {
-                            if enable_inject {
-                                if itx.send(*ev).is_err() {
-                                    log::error!("client: inject channel closed");
-                                }
-                            }
+                        if !handle_msg(msg, &switch, &itx, &wr, &crypter).await? {
+                            break;
                         }
-                        handle(msg, &wr, &crypter).await?;
                     }
                     Err(e) => {
                         log::error!("recv error: {:?}", e);
@@ -242,6 +306,57 @@ async fn session_client(
         }
     }
     Ok(())
+}
+
+/// 处理一条收到的消息。返回 `false` 表示会话应结束。
+///
+/// `switch` 为 `Some` 时处于 M3 模式：收到 `Transfer` 即接管指针；收到 `Hello`
+/// 时回填对端几何。M2 模式下 `Transfer` 会被忽略并告警。
+///
+/// `itx` 为 M2 客户端注入队列；非 M2（服务端 / switch 模式）传 `None`，
+/// 此时收到 `Input` 不会注入。
+async fn handle_msg(
+    msg: Message,
+    switch: &Option<Switch>,
+    itx: &Option<mpsc::UnboundedSender<InputEvent>>,
+    wr: &Arc<Mutex<WriteHalf<TcpStream>>>,
+    crypter: &Arc<Mutex<Crypter>>,
+) -> Result<bool> {
+    match msg {
+        Message::Heartbeat { t } => {
+            send_msg(wr, crypter, &Message::HeartbeatAck { t }).await?;
+        }
+        Message::HeartbeatAck { t } => {
+            log::info!("heartbeat ack, rtt = {} ms", now_ms().saturating_sub(t));
+        }
+        Message::Hello {
+            name,
+            platform,
+            screen_w,
+            screen_h,
+        } => {
+            log::info!("peer hello: {} ({}) screen {}x{}", name, platform, screen_w, screen_h);
+            if let Some(s) = switch {
+                s.set_peer_geom(screen_w, screen_h);
+            }
+        }
+        Message::Transfer(t) => {
+            if let Some(s) = switch {
+                s.on_receive(t.entry_x, t.entry_y);
+            } else {
+                log::warn!("received Transfer but --switch mode not enabled; ignoring");
+            }
+        }
+        Message::Input(ev) => {
+            // M2 客户端：转发到本机注入 worker。服务端（itx=None）或不注入模式忽略。
+            if let Some(itx) = itx {
+                if itx.send(ev).is_err() {
+                    log::error!("client: inject channel closed");
+                }
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// 桥接：std::sync::mpsc (capture 线程) → tokio::mpsc (async 任务)。
@@ -266,31 +381,6 @@ fn bridge_tokio_to_inject(mut tokio_rx: mpsc::UnboundedReceiver<InputEvent>) {
         }
     }
     log::info!("inject worker: channel closed, stopping");
-}
-
-async fn handle(
-    msg: Message,
-    wr: &Arc<Mutex<WriteHalf<TcpStream>>>,
-    crypter: &Arc<Mutex<Crypter>>,
-) -> Result<()> {
-    match msg {
-        Message::Heartbeat { t } => {
-            // 收到对端心跳 → 回 HeartbeatAck（对端据此测量 RTT）。
-            log::debug!("heartbeat received, acking");
-            send_msg(wr, crypter, &Message::HeartbeatAck { t }).await?;
-        }
-        Message::HeartbeatAck { t } => {
-            log::info!("heartbeat ack, rtt = {} ms", now_ms().saturating_sub(t));
-        }
-        Message::Hello { name, platform } => {
-            log::info!("peer hello: {} ({})", name, platform);
-        }
-        Message::Input(_) => {
-            // 在 session_client 已被分发到 inject 队列；这里只 log
-            log::trace!("handle: input event dispatched");
-        }
-    }
-    Ok(())
 }
 
 /// 发送一帧加密消息。帧格式：`[u32 长度][u64 计数器][密文+GCM标签]`。
