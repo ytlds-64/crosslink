@@ -1,10 +1,15 @@
 # crosslink Windows verification script (PS 5.1-friendly).
-# Pure PowerShell — no .bat / .cmd subprocesses.
-# Avoids PS 5.1 same-file dual-redirect ban by spawning each crosslink via
-# `cmd.exe /c "... > log 2>&1"` — the redirect happens inside cmd, not on Start-Process.
-# Run as Administrator if you want SendInput to actually land on UAC-elevated windows.
+# Uses [System.Diagnostics.ProcessStartInfo] directly to launch crosslink.
+# Avoids the Start-Process + cmd.exe /c + embedded-quotes param-eating bug
+# that ate our --server/--client args (everything got stripped, only clap's
+# Usage block landed in the log).
+# Run as Administrator if you want SendInput to land on UAC-elevated windows.
 
 $ErrorActionPreference = "Continue"
+
+# ---- Force UTF-8 console so env_logger writes readable bytes ----
+chcp 65001 > $null
+$OutputEncoding = [System.Text.Encoding]::UTF8
 
 # ---- Find binary ----
 $bin = $null
@@ -20,7 +25,6 @@ if (-not $bin) {
     exit 1
 }
 Write-Host "Using binary: $bin"
-$bindir = Split-Path -Parent $bin
 
 # ---- Pre-clean ----
 foreach ($f in @(".\srv_inject.log",".\cli_inject.log",".\srv_cap.log",".\cli_cap.log")) {
@@ -29,51 +33,89 @@ foreach ($f in @(".\srv_inject.log",".\cli_inject.log",".\srv_cap.log",".\cli_ca
 Get-Process crosslink -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 
-# ---- Pick two free-ish ports ----
+# ---- Helper: launch crosslink via .NET ProcessStartInfo, async-capture streams ----
+function Start-Xlink {
+    param([string[]]$ArgArray, [string]$LogPath)
+    if (Test-Path $LogPath) { Remove-Item -LiteralPath $LogPath -Force }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $bin
+    $psi.Arguments = ($ArgArray | ForEach-Object {
+            if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ }
+        }) -join ' '
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.WorkingDirectory = (Get-Location).Path
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+
+    # Async reads so the child never blocks on a full pipe buffer
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+    return @{ Proc = $proc; StdoutTask = $stdoutTask; StderrTask = $stderrTask; LogPath = $LogPath }
+}
+
+# ---- Helper: stop process, write merged log ----
+function Stop-Xlink {
+    param($Runner)
+    Start-Sleep -Milliseconds 500
+    if (-not $Runner.Proc.HasExited) {
+        try { $Runner.Proc.Kill() } catch {}
+    }
+    $Runner.Proc.WaitForExit(3000) | Out-Null
+    $stdout = ""
+    $stderr = ""
+    try { $stdout = $Runner.StdoutTask.Result } catch {}
+    try { $stderr = $Runner.StderrTask.Result } catch {}
+    $content = $stdout + "`n" + $stderr
+    [System.IO.File]::WriteAllText($Runner.LogPath, $content, [System.Text.Encoding]::UTF8)
+}
+
+# ---- Pick two random ports (avoid common defaults) ----
 $port1 = Get-Random -Minimum 4244 -Maximum 8999
 $port2 = $port1 + 1
-
-# Helper: launch crosslink via cmd /c with stdout+stderr merged into $LogPath
-# This works around PS 5.1's ban on same-file dual-redirect for Start-Process.
-function Start-Xlink {
-    param([string]$Args, [string]$LogPath)
-    if (Test-Path $LogPath) { Remove-Item -LiteralPath $LogPath -Force }
-    $cmdLine = '/c ""' + $bin + '" ' + $Args + ' > "' + $LogPath + '" 2>&1"'
-    Start-Process -FilePath cmd.exe -ArgumentList $cmdLine -NoNewWindow
-}
 
 # ============================================================
 Write-Host ""
 Write-Host "===== Test 1: Injection auth (server test-input + client) ====="
-Start-Xlink "--server --no-capture --test-input --port $port1 --name win-srv" ".\srv_inject.log"
+$T1Srv = Start-Xlink @('--server','--no-capture','--test-input','--port',"$port1",'--name','win-srv') ".\srv_inject.log"
 Start-Sleep -Seconds 3
-Start-Xlink "--client 127.0.0.1 --port $port1 --name win-cli" ".\cli_inject.log"
+$T1Cli = Start-Xlink @('--client','127.0.0.1','--port',"$port1",'--name','win-cli') ".\cli_inject.log"
 Start-Sleep -Seconds 6
-Get-Process crosslink -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 1
+Stop-Xlink $T1Srv
+Stop-Xlink $T1Cli
 
 Write-Host ""
 Write-Host "===== Test 2: Capture auth (server captures + client --no-inject) ====="
-Start-Xlink "--server --port $port2 --name win-srv" ".\srv_cap.log"
+$T2Srv = Start-Xlink @('--server','--port',"$port2",'--name','win-srv') ".\srv_cap.log"
 Start-Sleep -Seconds 3
-Start-Xlink "--client 127.0.0.1 --port $port2 --name win-cli --no-inject" ".\cli_cap.log"
+$T2Cli = Start-Xlink @('--client','127.0.0.1','--port',"$port2",'--name','win-cli','--no-inject') ".\cli_cap.log"
 Start-Sleep -Seconds 6
-Get-Process crosslink -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 1
+Stop-Xlink $T2Srv
+Stop-Xlink $T2Cli
 
 # ---- Inspect logs ----
-function Read-Log([string]$Path) {
+function Read-Log {
+    param([string]$Path)
     if (Test-Path $Path) {
-        try { return (Get-Content -Path $Path -Raw -ErrorAction Stop) }
-        catch { return "" }
+        try { return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8) }
+        catch {
+            try { return (Get-Content -Path $Path -Raw -ErrorAction Stop) } catch { return "" }
+        }
     } else { return "" }
 }
 
 Write-Host ""
 Write-Host "===== Verdict ====="
 $cli1log = Read-Log ".\cli_inject.log"
-if ([string]::IsNullOrEmpty($cli1log)) {
-    Write-Host "[FAIL] injection: cli_inject.log MISSING (client failed to start)"
+if ([string]::IsNullOrWhiteSpace($cli1log)) {
+    Write-Host "[FAIL] injection: cli_inject.log empty/missing"
+    $injection = "FAIL"
+} elseif ($cli1log -match '(?m)^\s*Usage:') {
+    Write-Host "[FAIL] injection: client printed Usage only (args not delivered)"
     $injection = "FAIL"
 } elseif ($cli1log -match 'inject failed') {
     Write-Host "[FAIL] injection: 'inject failed' found (re-run as Administrator)"
@@ -84,8 +126,11 @@ if ([string]::IsNullOrEmpty($cli1log)) {
 }
 
 $srv2log = Read-Log ".\srv_cap.log"
-if ([string]::IsNullOrEmpty($srv2log)) {
-    Write-Host "[FAIL] capture: srv_cap.log MISSING (server failed to start)"
+if ([string]::IsNullOrWhiteSpace($srv2log)) {
+    Write-Host "[FAIL] capture: srv_cap.log empty/missing"
+    $capture = "FAIL"
+} elseif ($srv2log -match '(?m)^\s*Usage:') {
+    Write-Host "[FAIL] capture: server printed Usage only (args not delivered)"
     $capture = "FAIL"
 } elseif ($srv2log -match 'handshake complete') {
     Write-Host "[OK]   capture: server captured 'handshake complete'"
