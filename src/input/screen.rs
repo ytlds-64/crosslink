@@ -48,26 +48,37 @@ mod imp {
     }
 
     pub fn get_cursor_pos() -> (i32, i32) {
-        // 关键：core-graphics 0.22 没有 `CGEvent::mouseLocation()` 静态方法。
-        // `CGEvent::new(source)` 强制要 source，源码注释也写明返回的是「新事件，
-        // 默认 location (0, 0)」——所以之前用它读到的一直是 (0, 0)，Mac 监控线程
-        // 永远不解锁 armed，M3 真机只能往返一次。
+        // Apple 官方姿势：从 Cocoa 的 `[NSEvent mouseLocation]` 读全局鼠标位置。
         //
-        // 正确做法：直接调 C API `CGEventCreate(NULL)`，传 NULL 时 CoreGraphics
-        // 会捕获**当前系统状态**，事件里的 location 就是真实光标位置。
+        // 走过的两个坑（教训已写入项目记忆）：
+        //  1. core-graphics 0.22 的 `CGEvent::new(source).location()`：source 参数
+        //     强制要，所以总是返回「新建事件」、location 默认 (0, 0)，不是真实光标。
+        //  2. 裸 C API `CGEventCreate(NULL).location`：Apple 文档明确说
+        //     "The location of a newly created event is (0, 0)"，和 (1) 同病。
+        //     b9e7d57 的修复就是这条错路。
+        //
+        // 正确方法：`[NSEvent mouseLocation]`（AppKit，Cocoa 类方法），不需要
+        // NSApplication 也不需要任何 TCC 授权。需要在 extern 块上挂
+        // `#[link(name = "AppKit", kind = "framework")]` 让链接器拉入 AppKit。
+        // CGPoint (16 字节，#[repr(C)] { f64, f64 }) 在 x86_64 SysV 是 SSE 类返回
+        // 在 xmm0/xmm1、在 arm64 是寄存器返回，均与 Rust extern "C" 返回 CGPoint
+        // 的 ABI 一致，无需 objc_msgSend_stret。
+        #[link(name = "AppKit", kind = "framework")]
         extern "C" {
-            fn CGEventCreate(source: *const std::ffi::c_void) -> *const std::ffi::c_void;
-            fn CGEventGetLocation(event: *const std::ffi::c_void) -> CGPoint;
-            fn CFRelease(cf: *const std::ffi::c_void);
+            fn objc_getClass(name: *const i8) -> *const std::ffi::c_void;
+            fn sel_registerName(name: *const i8) -> *const std::ffi::c_void;
+            fn objc_msgSend(receiver: *const std::ffi::c_void, sel: *const std::ffi::c_void) -> CGPoint;
         }
         unsafe {
-            let event = CGEventCreate(std::ptr::null());
-            if event.is_null() {
+            let class = objc_getClass(b"NSEvent\0".as_ptr() as *const i8);
+            if class.is_null() {
                 return (0, 0);
             }
-            let p = CGEventGetLocation(event);
-            // CGEventCreate 返回的是 +1 retain，必须手动释放。
-            CFRelease(event);
+            let sel = sel_registerName(b"mouseLocation\0".as_ptr() as *const i8);
+            if sel.is_null() {
+                return (0, 0);
+            }
+            let p = objc_msgSend(class, sel);
             (p.x as i32, p.y as i32)
         }
     }
