@@ -399,8 +399,17 @@ async fn handle_msg(
         }
         Message::CursorState(c) => {
             // M4：仅客户端（Mac）按 server 指令显隐并 warp 光标；服务端不会收到该消息。
+            log::trace!(
+                "recv CursorState: on_mac={} x={} y={} (is_client={})",
+                c.on_mac,
+                c.x,
+                c.y,
+                is_client
+            );
             if is_client {
-                let _ = input::inject::handle_cursor_state(c.on_mac, c.x, c.y);
+                if let Err(e) = input::inject::handle_cursor_state(c.on_mac, c.x, c.y) {
+                    log::warn!("handle_cursor_state failed: {:?}", e);
+                }
             } else {
                 log::debug!("server received CursorState (ignored)");
             }
