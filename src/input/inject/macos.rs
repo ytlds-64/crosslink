@@ -100,24 +100,38 @@ unsafe fn set_nscursor_hidden(hidden: bool) {
 
 /// M4 无缝单光标：处理 Win server 发来的 `CursorState`。
 ///
-/// - `on_mac=true`：把 Mac 本地光标 warp 到 `(x, y)` 并显示；
-/// - `on_mac=false`：隐藏 Mac 光标（光标在 Win 区域时）。
+/// - `on_mac=true`：在 Mac 端通过 `CGEventPost(MouseMoved)` 把光标移到 `(x, y)` 并显示；
+/// - `on_mac=false`：系统级隐藏 Mac 光标（光标在 Win 区域时）。
 ///
-/// 需要「输入监控」授权（TCC）；若未授权 `CGWarpMouseCursorPosition` 会失败但
-/// `NSCursor hide/unhide` 通常仍可用——此处尽量静默处理，失败仅 log warn。
+/// **为什么不用 `CGWarpMouseCursorPosition`：** 该 API 在 macOS 上需要「输入监控」TCC
+/// 授权，未授权时**静默失败**（不报错），会造成「Mac 端 log 显示收到坐标但屏幕光标
+/// 不动」的诡异现象。改用 `CGEventPost(MouseMoved)` 走和键盘/按键同样的通路（只需
+/// 辅助功能授权），并同步更新本地 `CURSOR` 让后续 button 事件在正确位置投递。
+///
+/// 显示/隐藏也改用 `CGDisplayShowCursor` / `CGDisplayHideCursor`（系统级、不需要
+/// TCC），不再用 `NSCursor hide/unhide`（其作用范围仅限当前 app，对跨 app 全屏显示
+/// 不可靠）。
 pub fn handle_cursor_state(on_mac: bool, x: u32, y: u32) -> Result<()> {
     *CURSOR_SHOWN.lock().unwrap() = on_mac;
     if on_mac {
-        // 更新本地累积位置，让后续 button 事件在正确位置投递
-        *CURSOR.lock().unwrap() = CGPoint { x: x as f64, y: y as f64 };
         let p = CGPoint { x: x as f64, y: y as f64 };
-        // warp Mac 光标到目标位置（CGWarpMouseCursorPosition 需要 TCC 输入监控）
-        let _ = CGDisplay::warp_mouse_cursor_position(p);
-        unsafe { set_nscursor_hidden(false); }
-        log::debug!("m4 inject: cursor shown on Mac at ({}, {})", x, y);
+        // 更新本地累积位置，让后续 button 事件在正确位置投递
+        *CURSOR.lock().unwrap() = p;
+        // 强制移动 Mac 光标：post 一个 MouseMoved 事件到 HID 系统事件流
+        // （CGEventPost 需要辅助功能权限；现在和正常 inject 路径一致）
+        let source = make_source()?;
+        let cg = CGEvent::new_mouse_event(source, CGEventType::MouseMoved, p, CGMouseButton::Left)
+            .map_err(|_| anyhow!("macOS: CGEventCreateMouseEvent(MouseMoved) failed (权限?)"))?;
+        cg.post(CGEventTapLocation::HID);
+        // 系统级显示光标（CGDisplayShowCursor 是引用计数的、不需要 TCC）
+        // 主显示器 id 即可——跨显示器会被 macOS 路由
+        let _ = CGDisplay::main().show_cursor();
+        log::trace!("m4 inject: cursor shown on Mac at ({}, {})", x, y);
     } else {
-        unsafe { set_nscursor_hidden(true); }
-        log::debug!("m4 inject: cursor hidden on Mac (in Win region)");
+        // 系统级隐藏光标（CGDisplayHideCursor 是引用计数的、不需要 TCC）
+        // 主显示器 id 即可——跨显示器会被 macOS 路由
+        let _ = CGDisplay::main().hide_cursor();
+        log::trace!("m4 inject: cursor hidden on Mac (in Win region)");
     }
     Ok(())
 }

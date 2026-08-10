@@ -75,6 +75,11 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
     let mut on_mac = false; // false=Win 区域，true=Mac 区域
     let mut mac_cursor_x: i64 = 0;
     let mut mac_cursor_y: i64 = 0;
+    // M4-D 节流：仅在距离上次发送 >= 16ms（约 60fps）且坐标真正变化时才发 CursorState，
+    // 避免 5ms 轮询导致每秒 200 条消息把 Mac 端日志系统冲爆 + 浪费网络。
+    let mut last_stream = std::time::Instant::now();
+    let mut last_sent_x: i64 = -1;
+    let mut last_sent_y: i64 = -1;
 
     loop {
         // ---- 键盘 ----
@@ -177,9 +182,12 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
                     // dx=0 时立刻把光标当成「还在右缘」自触发，导致和 M4-B 来回弹跳
                     // （Win 物理光标在 Mac 区域时被隐藏并不动）。
                     if !on_mac && p.x >= win_w_i - 1 && dx > 0 {
-                        // **先隐藏再 warp**：避免 warp 瞬间在 (0, p.y) 闪一帧。
-                        //   不能用 ClipCursor：物理钳制会让 GetCursorPos 的 dx 恒为 0，
-                        //   mac_cursor_x 不再累积，Mac 光标立刻卡住。
+                        // **隐藏策略**（Windows API 限制，无法做到"完全不显示"）：
+                        //   ①ShowCursor(FALSE) 把引用计数拉到 < 0（尽力而为）
+                        //   ②SetCursorPos 到 (0, p.y) 让 Win 物理光标钉在左缘——视觉上
+                        //     是一个静态的、不随鼠标移动的小点
+                        // 不能用 ClipCursor：物理钳制会让 GetCursorPos 的 dx 恒为 0，
+                        // mac_cursor_x 不再累积，Mac 光标立刻卡住。
                         set_cursor_visible(false);
                         let _ = unsafe { SetCursorPos(0, p.y) };
                         on_mac = true;
@@ -231,26 +239,31 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
                     // 位置只通过 CursorState（绝对坐标）驱动 Mac 光标，避免在 Mac
                     // 上既 warp 又注入相对位移造成双重移动/漂移。相对位移不再经
                     // Message::Input 发送（macOS inject 只在 M2 模式才会用到 delta）。
-                    if dx != 0 || dy != 0 {
-                        if on_mac {
-                            mac_cursor_x += dx as i64;
-                            mac_cursor_y += map_y(dy as i64, opts.win_h, mac_h);
+                    //
+                    // 节流：≤60fps（≥16ms 一次）+ 坐标真变才发，避免每 5ms 帧都重复发
+                    // 同一坐标造成日志/网络风暴。
+                    if on_mac && (dx != 0 || dy != 0) {
+                        mac_cursor_x += dx as i64;
+                        mac_cursor_y += map_y(dy as i64, opts.win_h, mac_h);
+                        let new_x = mac_cursor_x.clamp(0, mac_w as i64);
+                        let new_y = mac_cursor_y.clamp(0, mac_h as i64);
+                        let now = std::time::Instant::now();
+                        let since = now.duration_since(last_stream);
+                        if (new_x != last_sent_x || new_y != last_sent_y)
+                            && since >= std::time::Duration::from_millis(16)
+                        {
                             let _ = tx.send(CaptureMsg::CursorState {
                                 on_mac: true,
-                                x: mac_cursor_x.clamp(0, mac_w as i64) as u32,
-                                y: mac_cursor_y.clamp(0, mac_h as i64) as u32,
+                                x: new_x as u32,
+                                y: new_y as u32,
                             });
-                            // 低频调试日志（~每秒 1 次）方便排查 Mac 光标是否跟随
-                            log::trace!(
-                                "m4 stream: dx={} dy={} mac=({}, {})",
-                                dx,
-                                dy,
-                                mac_cursor_x.clamp(0, mac_w as i64),
-                                mac_cursor_y.clamp(0, mac_h as i64)
-                            );
+                            last_sent_x = new_x;
+                            last_sent_y = new_y;
+                            last_stream = now;
+                            log::trace!("m4 stream: dx={} dy={} mac=({}, {})", dx, dy, new_x, new_y);
                         }
-                        // Win 区域：Mac 光标隐藏，不转发
                     }
+                    // 旧版每帧无条件发，导致 5773 条日志；现在按需发。
                 } else {
                     // M2/M3 默认：原样转发相对位移
                     let dx16 = dx as i16;
