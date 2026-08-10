@@ -6,9 +6,11 @@
 //!
 //! 注意：本模块仅在 `cfg(target_os = "macos")` 下编译；沙箱无 Mac，仅做类型检查。
 
+use std::ffi::c_void;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
+use core_graphics::display::CGDisplay;
 use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
@@ -18,6 +20,10 @@ use crate::input::keycodes;
 
 /// 客户端本地光标位置（由收到的相对位移累积）。绝对坐标用于 button 事件定位。
 static CURSOR: Mutex<CGPoint> = Mutex::new(CGPoint { x: 0.0, y: 0.0 });
+
+/// M4：当前光标是否显示在 Mac 上。`false` 时 inject_event 仍会累计位置但不实际
+/// 投递鼠标移动（避免在 Mac 隐藏光标的情况下还动它）。
+static CURSOR_SHOWN: Mutex<bool> = Mutex::new(false);
 
 /// 创建事件源（每次使用新建，避免 move 问题；开销极小）。
 fn make_source() -> Result<CGEventSource> {
@@ -60,12 +66,58 @@ pub fn inject_event(ev: InputEvent) -> Result<()> {
                 let mut pos = CURSOR.lock().unwrap();
                 pos.x += m.dx as f64;
                 pos.y += m.dy as f64;
-                let source = make_source()?;
-                let cg = CGEvent::new_mouse_event(source, CGEventType::MouseMoved, *pos, CGMouseButton::Left)
-                    .map_err(|_| anyhow!("macOS: CGEventCreateMouseEvent (move) failed (权限?)"))?;
-                cg.post(CGEventTapLocation::HID);
+                // M4：光标在 Mac 区域时才投递鼠标移动事件（光标隐藏时不投递）
+                let shown = *CURSOR_SHOWN.lock().unwrap();
+                if shown {
+                    let source = make_source()?;
+                    let cg = CGEvent::new_mouse_event(source, CGEventType::MouseMoved, *pos, CGMouseButton::Left)
+                        .map_err(|_| anyhow!("macOS: CGEventCreateMouseEvent (move) failed (权限?)"))?;
+                    cg.post(CGEventTapLocation::HID);
+                }
             }
             Ok(())
         }
     }
+}
+
+// ---- M4：通过 Cocoa NSCursor 控制光标显隐 ----
+//
+// 与 screen.rs 里读 [NSEvent mouseLocation] 同样的 objc_msgSend 套路。
+// 这里只发无返回值的消息（hide/unhide），不需要 ABI 复杂的返回类型。
+
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {
+    fn objc_getClass(name: *const u8) -> *const c_void;
+    fn sel_registerName(name: *const u8) -> *const c_void;
+    fn objc_msgSend(receiver: *const c_void, sel: *const c_void);
+}
+
+unsafe fn set_nscursor_hidden(hidden: bool) {
+    let cls = objc_getClass(b"NSCursor\0".as_ptr());
+    let sel = sel_registerName(if hidden { b"hide\0".as_ptr() } else { b"unhide\0".as_ptr() });
+    objc_msgSend(cls, sel);
+}
+
+/// M4 无缝单光标：处理 Win server 发来的 `CursorState`。
+///
+/// - `on_mac=true`：把 Mac 本地光标 warp 到 `(x, y)` 并显示；
+/// - `on_mac=false`：隐藏 Mac 光标（光标在 Win 区域时）。
+///
+/// 需要「输入监控」授权（TCC）；若未授权 `CGWarpMouseCursorPosition` 会失败但
+/// `NSCursor hide/unhide` 通常仍可用——此处尽量静默处理，失败仅 log warn。
+pub fn handle_cursor_state(on_mac: bool, x: u32, y: u32) -> Result<()> {
+    *CURSOR_SHOWN.lock().unwrap() = on_mac;
+    if on_mac {
+        // 更新本地累积位置，让后续 button 事件在正确位置投递
+        *CURSOR.lock().unwrap() = CGPoint { x: x as f64, y: y as f64 };
+        let p = CGPoint { x: x as f64, y: y as f64 };
+        // warp Mac 光标到目标位置（CGWarpMouseCursorPosition 需要 TCC 输入监控）
+        let _ = CGDisplay::warp_mouse_cursor_position(p);
+        unsafe { set_nscursor_hidden(false); }
+        log::debug!("m4 inject: cursor shown on Mac at ({}, {})", x, y);
+    } else {
+        unsafe { set_nscursor_hidden(true); }
+        log::debug!("m4 inject: cursor hidden on Mac (in Win region)");
+    }
+    Ok(())
 }

@@ -116,3 +116,9 @@ pub fn inject(ev: InputEvent) -> Result<()> {
         }
     }
 }
+
+/// M4：Windows 端是 master（Win 控制 Mac），不会收到 `CursorState`（那是 Win 发给 Mac 的）。
+/// 为 API 统一提供 no-op 占位；真正的实现只在 `inject/macos.rs`。
+pub fn handle_cursor_state(_on_mac: bool, _x: u32, _y: u32) -> Result<()> {
+    Ok(())
+}

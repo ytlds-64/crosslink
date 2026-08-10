@@ -22,6 +22,7 @@ use core_graphics::event::{
 
 use crate::input::event::{InputEvent, KeyEvent, KeyState, MouseButton, MouseEvent};
 use crate::input::keycodes;
+use crate::input::{CaptureMsg, CaptureOptions};
 
 // 跟踪上一次的修饰键 flags（用于从 `FlagsChanged` 事件推断按下/释放）。
 thread_local! {
@@ -41,13 +42,16 @@ fn flag_bit_for(kc: u16) -> Option<u64> {
 }
 
 /// 启动 macOS 输入捕获，返回事件 channel 的接收端。
-pub fn start_capture() -> Receiver<InputEvent> {
+///
+/// `opts` 在 macOS 上未使用（M4 模式下 Mac 是 slave，不做 capture；M2/M3 模式下
+/// 也不需要屏幕几何）。保留参数仅为与 Windows 端 API 对齐。
+pub fn start_capture(_opts: CaptureOptions) -> Receiver<CaptureMsg> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || run_capture(tx));
     rx
 }
 
-fn run_capture(tx: Sender<InputEvent>) {
+fn run_capture(tx: Sender<CaptureMsg>) {
     log::info!("input capture: starting macOS CGEventTap");
 
     let events_of_interest = vec![
@@ -100,7 +104,7 @@ fn run_capture(tx: Sender<InputEvent>) {
 }
 
 /// 把一条 CGEvent 翻译为内部 `InputEvent` 并发送；返回 `None` 由上层透传。
-fn translate(et: CGEventType, ev: &CGEvent, tx: &Sender<InputEvent>) {
+fn translate(et: CGEventType, ev: &CGEvent, tx: &Sender<CaptureMsg>) {
     match et {
         CGEventType::KeyDown | CGEventType::KeyUp => {
             let kc = ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
@@ -109,7 +113,7 @@ fn translate(et: CGEventType, ev: &CGEvent, tx: &Sender<InputEvent>) {
                     CGEventType::KeyDown => KeyState::Pressed,
                     _ => KeyState::Released, // 本分支只可能是 KeyUp
                 };
-                let _ = tx.send(InputEvent::Key(KeyEvent { hid, state }));
+                let _ = tx.send(CaptureMsg::Input(InputEvent::Key(KeyEvent { hid, state })));
             }
         }
         CGEventType::FlagsChanged => {
@@ -120,14 +124,14 @@ fn translate(et: CGEventType, ev: &CGEvent, tx: &Sender<InputEvent>) {
                 let was_down = (prev & bit) != 0;
                 let is_down = (now & bit) != 0;
                 if is_down != was_down {
-                    let _ = tx.send(InputEvent::Key(KeyEvent {
+                    let _ = tx.send(CaptureMsg::Input(InputEvent::Key(KeyEvent {
                         hid,
                         state: if is_down {
                             KeyState::Pressed
                         } else {
                             KeyState::Released
                         },
-                    }));
+                    })));
                 }
                 PREV_FLAGS.with(|p| p.set(now));
             }
@@ -149,12 +153,12 @@ fn translate(et: CGEventType, ev: &CGEvent, tx: &Sender<InputEvent>) {
                 | CGEventType::OtherMouseDown => KeyState::Pressed,
                 _ => KeyState::Released,
             };
-            let _ = tx.send(InputEvent::Mouse(MouseEvent {
+            let _ = tx.send(CaptureMsg::Input(InputEvent::Mouse(MouseEvent {
                 dx: 0,
                 dy: 0,
                 button: Some(btn),
                 state: Some(state),
-            }));
+            })));
         }
         CGEventType::MouseMoved
         | CGEventType::LeftMouseDragged
@@ -163,12 +167,12 @@ fn translate(et: CGEventType, ev: &CGEvent, tx: &Sender<InputEvent>) {
             let dx = ev.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as i16;
             let dy = ev.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as i16;
             if dx != 0 || dy != 0 {
-                let _ = tx.send(InputEvent::Mouse(MouseEvent {
+                let _ = tx.send(CaptureMsg::Input(InputEvent::Mouse(MouseEvent {
                     dx,
                     dy,
                     button: None,
                     state: None,
-                }));
+                })));
             }
         }
         _ => {}

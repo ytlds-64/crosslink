@@ -70,6 +70,14 @@ struct Cli {
     /// Override on both ends consistently for other layouts.
     #[arg(long, value_enum)]
     side: Option<SideArg>,
+
+    /// Enable M4 seamless single-cursor mode: the Windows server drives one logical
+    /// cursor that slides from the Win screen onto the Mac screen. Requires the Win
+    /// machine to be the server and the Mac to be the client. Mutually exclusive with
+    /// --switch (edge-switching). In M4 the Win mouse keeps controlling the Mac cursor
+    /// continuously, instead of just handing off ownership.
+    #[arg(long)]
+    m4: bool,
 }
 
 /// CLI 侧 `--side` 取值（clap ValueEnum），运行时映射为 `switch::Side`。
@@ -98,6 +106,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    if cli.m4 && cli.switch {
+        eprintln!("Error: --m4 (seamless single-cursor) and --switch (edge-switching) are mutually exclusive");
+        std::process::exit(2);
+    }
+
     // --switch 模式下，对端相对本机的位置：服务端默认右、客户端默认左。
     let side: Side = cli
         .side
@@ -121,6 +134,7 @@ async fn main() -> Result<()> {
                 cli.test_input,
                 cli.switch,
                 side,
+                cli.m4,
             )
             .await?;
         }
@@ -133,6 +147,7 @@ async fn main() -> Result<()> {
                 !cli.no_inject,
                 cli.switch,
                 side,
+                cli.m4,
             )
             .await?;
         }

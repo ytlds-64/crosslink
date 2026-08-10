@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,8 +11,9 @@ use tokio::time::interval;
 use crate::input;
 use crate::input::event::{InputEvent, KeyEvent, KeyState, MouseButton, MouseEvent};
 use crate::input::screen;
+use crate::input::{CaptureMsg, CaptureOptions};
 use crate::net::crypto::{self, Crypter, StaticSecret};
-use crate::net::protocol::{Message, Transfer};
+use crate::net::protocol::{CursorState, Message, Transfer};
 use crate::switch::{Side, Switch};
 
 /// 启动一个服务端会话：绑定端口、接受单连接、加密握手、进入会话循环。
@@ -24,6 +26,9 @@ use crate::switch::{Side, Switch};
 ///
 /// `switch_mode` 为 true 时启用 M3 边缘切换：服务端初始持有指针，不再转发输入，
 /// 仅在对端接缝边时交换 `Transfer` 消息。
+///
+/// `m4_mode` 为 true 时启用 M4 无缝单光标：Win 光标在 Win 右缘自动 warp 到左缘
+/// 切到 Mac 区域（光标隐藏），通过 `Message::CursorState` 通知 Mac 显示。
 pub async fn run_server(
     bind: &str,
     port: u16,
@@ -33,6 +38,7 @@ pub async fn run_server(
     test_input: bool,
     switch_mode: bool,
     side: Side,
+    m4_mode: bool,
 ) -> Result<()> {
     let listener = TcpListener::bind((bind, port))
         .await
@@ -42,7 +48,7 @@ pub async fn run_server(
     loop {
         let (stream, peer) = listener.accept().await?;
         log::info!("accepted connection from {}", peer);
-        if let Err(e) = session_server(stream, key, name, enable_capture, test_input, switch_mode, side).await {
+        if let Err(e) = session_server(stream, key, name, enable_capture, test_input, switch_mode, side, m4_mode).await {
             log::error!("session ended with error: {:?}", e);
         }
         log::info!("session closed, waiting for next connection");
@@ -53,6 +59,9 @@ pub async fn run_server(
 ///
 /// `enable_inject` 为 true 时，收到 `Message::Input` 会通过 `SendInput`
 /// 注入到本机键盘队列（M2 模式）。
+///
+/// `m4_mode` 为 true 时启用 M4 无缝单光标：收到 `Message::CursorState` 会
+/// 通过 `[NSCursor hide/unhide]` 控制 Mac 光标显隐并 warp 到指定位置。
 pub async fn run_client(
     addr: &str,
     port: u16,
@@ -61,12 +70,13 @@ pub async fn run_client(
     enable_inject: bool,
     switch_mode: bool,
     side: Side,
+    m4_mode: bool,
 ) -> Result<()> {
     let stream = TcpStream::connect((addr, port))
         .await
         .with_context(|| format!("connect {}:{}", addr, port))?;
     log::info!("connected to {}:{}", addr, port);
-    session_client(stream, fingerprint, name, enable_inject, switch_mode, side).await
+    session_client(stream, fingerprint, name, enable_inject, switch_mode, side, m4_mode).await
 }
 
 async fn session_server(
@@ -77,6 +87,7 @@ async fn session_server(
     test_input: bool,
     switch_mode: bool,
     side: Side,
+    m4_mode: bool,
 ) -> Result<()> {
     let (crypter, _fp) = crypto::server_handshake(&mut stream, key).await?;
     log::info!("handshake complete");
@@ -86,6 +97,10 @@ async fn session_server(
 
     // ---- 屏幕几何（用于 Hello 交换；M3 边缘切换需要）----
     let (my_w, my_h) = screen::screen_size();
+
+    // ---- 对端屏幕几何（M4 用于 y 坐标映射与光标位置 clamp）----
+    let mac_w_atomic = Arc::new(AtomicU32::new(0));
+    let mac_h_atomic = Arc::new(AtomicU32::new(0));
 
     // ---- 边缘切换控制器（仅 switch 模式）----
     let (sw_tx, mut sw_rx) = mpsc::unbounded_channel::<Transfer>();
@@ -97,13 +112,23 @@ async fn session_server(
         None
     };
 
-    // ---- M2 捕获桥（仅非 switch 模式）----
-    let (etx, mut erx) = mpsc::unbounded_channel::<InputEvent>();
+    // ---- M2/M4 捕获桥（仅非 switch 模式）----
+    let (etx, mut erx) = mpsc::unbounded_channel::<CaptureMsg>();
     if !switch_mode && enable_capture {
-        let std_rx = input::capture::start_capture();
+        let std_rx = input::capture::start_capture(CaptureOptions {
+            win_w: my_w,
+            win_h: my_h,
+            mac_w: mac_w_atomic.clone(),
+            mac_h: mac_h_atomic.clone(),
+            m4_mode,
+        });
         let etx_c = etx.clone();
         tokio::task::spawn_blocking(move || bridge_capture_to_tokio(std_rx, etx_c));
-        log::info!("server: keyboard+mouse capture → wire enabled");
+        if m4_mode {
+            log::info!("server: M4 seamless-cursor capture enabled (win={}x{})", my_w, my_h);
+        } else {
+            log::info!("server: keyboard+mouse capture → wire enabled");
+        }
     } else if switch_mode {
         log::info!("server: --switch mode (edge switching), capture disabled");
     } else {
@@ -131,32 +156,32 @@ async fn session_server(
             ];
             for (h, s) in sequence {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                let _ = etx_test.send(InputEvent::Key(KeyEvent { hid: h, state: s }));
+                let _ = etx_test.send(CaptureMsg::Input(InputEvent::Key(KeyEvent { hid: h, state: s })));
             }
 
             // 鼠标：一次相对移动 + 左键按下/释放
             log::info!("test-input: sending mock mouse events (move + left button)");
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let _ = etx_test.send(InputEvent::Mouse(MouseEvent {
+            let _ = etx_test.send(CaptureMsg::Input(InputEvent::Mouse(MouseEvent {
                 dx: 24,
                 dy: 12,
                 button: None,
                 state: None,
-            }));
+            })));
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let _ = etx_test.send(InputEvent::Mouse(MouseEvent {
+            let _ = etx_test.send(CaptureMsg::Input(InputEvent::Mouse(MouseEvent {
                 dx: 0,
                 dy: 0,
                 button: Some(MouseButton::Left),
                 state: Some(KeyState::Pressed),
-            }));
+            })));
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let _ = etx_test.send(InputEvent::Mouse(MouseEvent {
+            let _ = etx_test.send(CaptureMsg::Input(InputEvent::Mouse(MouseEvent {
                 dx: 0,
                 dy: 0,
                 button: Some(MouseButton::Left),
                 state: Some(KeyState::Released),
-            }));
+            })));
             log::info!("test-input: sequence done");
         });
     }
@@ -176,10 +201,16 @@ async fn session_server(
     let mut hb = interval(Duration::from_secs(3));
     loop {
         tokio::select! {
-            // 捕获事件 → 发送到对端（M2 模式）
-            Some(ev) = erx.recv(), if switch.is_none() => {
-                if let Err(e) = send_msg(&wr, &crypter, &Message::Input(ev)).await {
-                    log::error!("send input event error: {:?}", e);
+            // 捕获事件 → 发送到对端（M2 / M4 模式）
+            Some(msg) = erx.recv(), if switch.is_none() => {
+                let wire_msg = match msg {
+                    CaptureMsg::Input(ev) => Message::Input(ev),
+                    CaptureMsg::CursorState { on_mac, x, y } => {
+                        Message::CursorState(CursorState { on_mac, x, y })
+                    }
+                };
+                if let Err(e) = send_msg(&wr, &crypter, &wire_msg).await {
+                    log::error!("send capture msg error: {:?}", e);
                     break;
                 }
             }
@@ -194,7 +225,7 @@ async fn session_server(
             res = recv_msg(&mut rd, &crypter) => {
                 match res {
                     Ok(msg) => {
-                        if !handle_msg(msg, &switch, &None, &wr, &crypter).await? {
+                        if !handle_msg(msg, &switch, &None, false, &mac_w_atomic, &mac_h_atomic, &wr, &crypter).await? {
                             break;
                         }
                     }
@@ -224,6 +255,7 @@ async fn session_client(
     enable_inject: bool,
     switch_mode: bool,
     side: Side,
+    _m4_mode: bool,
 ) -> Result<()> {
     let (crypter, fp) = crypto::client_handshake(&mut stream, fingerprint).await?;
     log::info!("handshake complete, server fingerprint = {}", fp);
@@ -232,6 +264,10 @@ async fn session_client(
     let crypter = Arc::new(Mutex::new(crypter));
 
     let (my_w, my_h) = screen::screen_size();
+
+    // M4 对端几何（服务端在 Hello 中写入；客户端仅占位，保持签名统一）。
+    let mac_w_atomic = Arc::new(AtomicU32::new(0));
+    let mac_h_atomic = Arc::new(AtomicU32::new(0));
 
     let (sw_tx, mut sw_rx) = mpsc::unbounded_channel::<Transfer>();
     let switch: Option<Switch> = if switch_mode {
@@ -285,7 +321,7 @@ async fn session_client(
             res = recv_msg(&mut rd, &crypter) => {
                 match res {
                     Ok(msg) => {
-                        if !handle_msg(msg, &switch, &itx, &wr, &crypter).await? {
+                        if !handle_msg(msg, &switch, &itx, true, &mac_w_atomic, &mac_h_atomic, &wr, &crypter).await? {
                             break;
                         }
                     }
@@ -319,6 +355,9 @@ async fn handle_msg(
     msg: Message,
     switch: &Option<Switch>,
     itx: &Option<mpsc::UnboundedSender<InputEvent>>,
+    is_client: bool,
+    mac_w: &Arc<AtomicU32>,
+    mac_h: &Arc<AtomicU32>,
     wr: &Arc<Mutex<WriteHalf<TcpStream>>>,
     crypter: &Arc<Mutex<Crypter>>,
 ) -> Result<bool> {
@@ -339,6 +378,9 @@ async fn handle_msg(
             if let Some(s) = switch {
                 s.set_peer_geom(screen_w, screen_h);
             }
+            // M4：服务端记录对端（Mac）几何，capture 线程每帧读取用于 y 映射与 clamp。
+            mac_w.store(screen_w, Ordering::Relaxed);
+            mac_h.store(screen_h, Ordering::Relaxed);
         }
         Message::Transfer(t) => {
             if let Some(s) = switch {
@@ -355,14 +397,23 @@ async fn handle_msg(
                 }
             }
         }
+        Message::CursorState(c) => {
+            // M4：仅客户端（Mac）按 server 指令显隐并 warp 光标；服务端不会收到该消息。
+            if is_client {
+                let _ = input::inject::handle_cursor_state(c.on_mac, c.x, c.y);
+            } else {
+                log::debug!("server received CursorState (ignored)");
+            }
+        }
     }
     Ok(true)
 }
 
 /// 桥接：std::sync::mpsc (capture 线程) → tokio::mpsc (async 任务)。
-fn bridge_capture_to_tokio(
-    std_rx: std::sync::mpsc::Receiver<InputEvent>,
-    tokio_tx: mpsc::UnboundedSender<InputEvent>,
+/// 泛型化以支持 `InputEvent` 与 M4 的 `CaptureMsg` 两种通道类型。
+fn bridge_capture_to_tokio<T: Send + 'static>(
+    std_rx: std::sync::mpsc::Receiver<T>,
+    tokio_tx: mpsc::UnboundedSender<T>,
 ) {
     while let Ok(ev) = std_rx.recv() {
         if tokio_tx.send(ev).is_err() {
