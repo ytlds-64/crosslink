@@ -142,6 +142,21 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
             }
         }
 
+        // ---- M4: 在 Mac 区域期间，确保 Win 光标保持隐藏 ----
+        // 系统/其它进程可能通过 ShowCursor(TRUE) 把计数拉回 0+，每帧检查一次
+        // （计数 < 0 视为隐藏）。第一次 ShowCursor(FALSE) 总是自减 1；
+        // 如果减完 cnt < 0 就 break；否则继续减直到 cnt < 0。
+        if opts.m4_mode && on_mac {
+            unsafe {
+                loop {
+                    let n = ShowCursor(windows::Win32::Foundation::BOOL(0));
+                    if n < 0 {
+                        break;
+                    }
+                }
+            }
+        }
+
         // ---- 鼠标相对位移 ----
         let mut p = POINT { x: 0, y: 0 };
         if unsafe { GetCursorPos(&mut p) }.is_ok() {
@@ -156,8 +171,11 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
                     let mac_w = opts.mac_w.load(Ordering::Relaxed);
                     let mac_h = opts.mac_h.load(Ordering::Relaxed);
 
-                    // M4-A: 检测进入 Mac 区域（Win 光标到右缘 + 向右推）
-                    if !on_mac && p.x >= win_w_i - 1 && dx >= 0 {
+                    // M4-A: 检测进入 Mac 区域（Win 光标到右缘 + **真实**向右推）
+                    // 必须用 dx > 0（严格）：用 dx >= 0 会在 SetCursorPos(0,p.y) 后下一帧
+                    // dx=0 时立刻把光标当成「还在右缘」自触发，导致和 M4-B 来回弹跳
+                    // （Win 物理光标在 Mac 区域时被隐藏并不动）。
+                    if !on_mac && p.x >= win_w_i - 1 && dx > 0 {
                         // warp Win 光标到左缘（光标马上隐藏、用户看不到跳）
                         let _ = unsafe { SetCursorPos(0, p.y) };
                         set_cursor_visible(false);
@@ -176,13 +194,11 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
                     }
 
                     // M4-B: 检测返回 Win 区域。
-                    // 注意：返回判定必须基于「Mac 逻辑光标」是否到达 Mac 左缘
-                    // （mac_cursor_x <= 0），而非 Win 物理光标位置。因为进入 Mac 后
-                    // Win 光标被隐藏并 warp 到 x=0，任何向左的微小移动都会让 Win 物理
-                    // 光标立刻变成 x<=0，若用 p.x<=0 判定会一进 Mac 就弹回 Win，导致
-                    // 无法在 Mac 上向左移动。改为用 mac_cursor_x（按 delta 累积、clamp
-                    // 到 0）判定：只有当 Mac 光标已贴左缘仍继续左推时才切回 Win。
-                    if on_mac && mac_cursor_x <= 0 && dx <= 0 {
+                    // 严格 dx < 0：dx = 0（光标未动）时不能当成「推左」触发；否则会和
+                    // M4-A 来回弹（M4-A 把光标 warp 到左缘后 dx=0，立即触发 M4-B）。
+                    // 同时也用 mac_cursor_x <= 0（之前累计已经达到 Mac 左缘且还在继续左推），
+                    // 而非 Win 物理 p.x <= 0——后者在 Mac 区域时永远成立，会误触发。
+                    if on_mac && mac_cursor_x <= 0 && dx < 0 {
                         // warp Win 光标到右缘 + 恢复 Win 光标可见
                         let _ = unsafe { SetCursorPos(win_w_i - 1, p.y) };
                         set_cursor_visible(true);
@@ -201,7 +217,8 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
                     // M4-C: Mac 区域内循环 wrap（允许无限向右移动）
                     //   Win 光标在 Mac 区域到达 Win 物理右缘 → 静默 warp 到 Win 物理左缘
                     //   不切换区域、不改光标可见性、不发送 CursorState（Mac 光标连续平滑移动）
-                    if on_mac && p.x >= win_w_i - 1 && dx >= 0 {
+                    //   严格 dx > 0（只对真实右推做 wrap）
+                    if on_mac && p.x >= win_w_i - 1 && dx > 0 {
                         let _ = unsafe { SetCursorPos(0, p.y) };
                         last_pos = POINT { x: 0, y: p.y };
                         have_pos = true;
