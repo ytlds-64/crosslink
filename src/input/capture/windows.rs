@@ -146,6 +146,7 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
         // 系统/其它进程可能通过 ShowCursor(TRUE) 把计数拉回 0+，每帧检查一次
         // （计数 < 0 视为隐藏）。第一次 ShowCursor(FALSE) 总是自减 1；
         // 如果减完 cnt < 0 就 break；否则继续减直到 cnt < 0。
+        // 不能用 ClipCursor：物理钳制会让 dx=0，mac_cursor_x 不再累积 → Mac 光标卡住。
         if opts.m4_mode && on_mac {
             unsafe {
                 loop {
@@ -176,9 +177,11 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
                     // dx=0 时立刻把光标当成「还在右缘」自触发，导致和 M4-B 来回弹跳
                     // （Win 物理光标在 Mac 区域时被隐藏并不动）。
                     if !on_mac && p.x >= win_w_i - 1 && dx > 0 {
-                        // warp Win 光标到左缘（光标马上隐藏、用户看不到跳）
-                        let _ = unsafe { SetCursorPos(0, p.y) };
+                        // **先隐藏再 warp**：避免 warp 瞬间在 (0, p.y) 闪一帧。
+                        //   不能用 ClipCursor：物理钳制会让 GetCursorPos 的 dx 恒为 0，
+                        //   mac_cursor_x 不再累积，Mac 光标立刻卡住。
                         set_cursor_visible(false);
+                        let _ = unsafe { SetCursorPos(0, p.y) };
                         on_mac = true;
                         mac_cursor_x = 0;
                         mac_cursor_y = map_y(p.y as i64, opts.win_h, mac_h);
@@ -199,7 +202,6 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
                     // 同时也用 mac_cursor_x <= 0（之前累计已经达到 Mac 左缘且还在继续左推），
                     // 而非 Win 物理 p.x <= 0——后者在 Mac 区域时永远成立，会误触发。
                     if on_mac && mac_cursor_x <= 0 && dx < 0 {
-                        // warp Win 光标到右缘 + 恢复 Win 光标可见
                         let _ = unsafe { SetCursorPos(win_w_i - 1, p.y) };
                         set_cursor_visible(true);
                         on_mac = false;
@@ -238,6 +240,14 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
                                 x: mac_cursor_x.clamp(0, mac_w as i64) as u32,
                                 y: mac_cursor_y.clamp(0, mac_h as i64) as u32,
                             });
+                            // 低频调试日志（~每秒 1 次）方便排查 Mac 光标是否跟随
+                            log::trace!(
+                                "m4 stream: dx={} dy={} mac=({}, {})",
+                                dx,
+                                dy,
+                                mac_cursor_x.clamp(0, mac_w as i64),
+                                mac_cursor_y.clamp(0, mac_h as i64)
+                            );
                         }
                         // Win 区域：Mac 光标隐藏，不转发
                     }
