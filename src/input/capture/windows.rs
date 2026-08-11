@@ -254,6 +254,10 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
     let mut last_sent_x: i64 = -1;
     let mut last_sent_y: i64 = -1;
     let mut last_stream = Instant::now();
+    // 启动时如果光标已停在右缘（用户常因为习惯把鼠标停在屏幕最右），
+    // 一次性向内挪 50px，确保后续 push 能产生 dx_fb>0 触发 M4-A。
+    // 不挪的话 dx 永远 0，entry 永不触发。
+    let mut startup_nudged = false;
 
     let win_w_i = opts.win_w as i32;
 
@@ -321,6 +325,25 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
 
             let mut p = POINT { x: 0, y: 0 };
             let _ = unsafe { GetCursorPos(&mut p) };
+
+            // 启动 nudge：如果光标已停在右缘，dx 永远 0，entry 永不触发。
+            // 一次性向内挪 50px，让后续 push 能产生正 dx_fb 触发 M4-A。
+            if !startup_nudged {
+                if p.x >= win_w_i - 1 {
+                    let new_x = (p.x - 50).max(0);
+                    let _ = unsafe { SetCursorPos(new_x, p.y) };
+                    log::info!(
+                        "m4 startup: cursor was parked at right edge (x={}), nudged to x={} so M4-A can fire",
+                        p.x,
+                        new_x
+                    );
+                    p.x = new_x;
+                }
+                startup_nudged = true;
+                last_pos = p;
+                have_pos = true;
+                continue;
+            }
 
             if !on_mac {
                 let last_x = last_pos.x;
