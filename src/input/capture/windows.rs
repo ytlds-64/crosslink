@@ -18,13 +18,18 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::core::w;
+use windows::Win32::Foundation::{HWND, LRESULT, POINT, WPARAM, LPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::{
     GetRawInputBuffer, RegisterRawInputDevices, MOUSE_MOVE_RELATIVE, RAWINPUT, RAWINPUTDEVICE,
-    RAWINPUTHEADER, RIDEV_NOLEGACY, RIM_TYPEMOUSE,
+    RAWINPUTHEADER, RIDEV_INPUTSINK, RIDEV_NOLEGACY, RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos, ShowCursor};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, GetCursorPos, RegisterClassExW, SetCursorPos, ShowCursor,
+    HWND_MESSAGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+};
 
 use crate::input::event::{InputEvent, KeyEvent, KeyState, MouseButton, MouseEvent};
 use crate::input::keycodes;
@@ -44,36 +49,118 @@ pub fn start_capture(opts: CaptureOptions) -> Receiver<CaptureMsg> {
 fn register_raw_input_mouse() {
     // M4 必须用 raw input 读取鼠标 delta（与 cursor 物理位置解耦）。
     //
-    // flags 选择：
-    // - `RIDEV_NOLEGACY`：禁用 WM_INPUT/WM_MOUSEMOVE 路径，我们自己用 SetCursorPos
-    //   驱动 cursor 物理位置。如果不设，光标会同时被系统和我们的 SetCursorPos 抢。
-    // - **不要**加 `RIDEV_INPUTSINK`：INPUTSINK 要求 `hwndTarget` 是有效窗口句柄，
-    //   NULL 直接 `E_INVALIDARG`；并且 M4 也不需要——Win 端是 owner 时必然前台，
-    //   进 Mac 后 Win 端正好该静音。
+    // **关键约束（MSDN + 翻车总结）**：
+    // 1. `RegisterRawInputDevices` 的 `hwndTarget` 必须是 **valid HWND**。
+    //    console app 没窗口时，OS 不知道把 raw-input 数据 dispatch 到哪个 thread，
+    //    → `GetRawInputBuffer` 永远返 0 / size=0，raw input 根本不到。
+    // 2. `RIDEV_INPUTSINK` 才允许 raw input 在 **non-foreground** thread/window 收。
+    //    没它 → 仅前台窗口收 → 一旦 other 端接管（cursor 在 Mac），Win 端即使未失焦
+    //    也会因为 power-toys / IDE 占焦点收不到 raw input — M4 永久卡死。
     //
-    // 注意：cursor 在前缘 (`x = win_w - 1`) 时，**不能**用 ClipCursor 限制，否则
-    // cursor 永远到不了右缘、`SetCursorPos` 也会被 ClipCursor 拒绝。`RIDEV_NOLEGACY`
-    // 把 legacy 路径都关了，OS 也不会再推 cursor 出界，所以放心。
+    // flags 选择：`RIDEV_INPUTSINK | RIDEV_NOLEGACY`
+    // - `RIDEV_NOLEGACY`：禁用 WM_INPUT/WM_MOUSEMOVE 路径，自己用 SetCursorPos 驱动
+    //   cursor 物理位置。
+    // - `RIDEV_INPUTSINK`：即便 PowerShell/IDE 占焦点，raw input 仍到本 thread。
+    //
+    // 修法（e05d167+）：创建 **message-only hidden window** 作为 hwndTarget。
+    //   - hwndTarget 有效（不是 NULL）
+    //   - raw-input buffer 派发到本 thread
+    //   - 窗口隐藏 + WS_EX_TOOLWINDOW，**绝不会被用户看到**
+    let hwnd = create_message_only_sink();
+
     let rid = RAWINPUTDEVICE {
         usUsagePage: 0x01,
         usUsage: 0x02,
-        dwFlags: RIDEV_NOLEGACY,
-        hwndTarget: HWND(std::ptr::null_mut()),
+        dwFlags: RIDEV_NOLEGACY | RIDEV_INPUTSINK,
+        hwndTarget: hwnd,
     };
     let size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
     let result = unsafe { RegisterRawInputDevices(&[rid], size) };
     match result {
-        Ok(_) => log::info!("M4: raw input mouse registered (RIDEV_NOLEGACY)"),
+        Ok(_) => log::info!(
+            "M4: raw input mouse registered (RIDEV_NOLEGACY | RIDEV_INPUTSINK, hwnd={:?})",
+            hwnd.0
+        ),
         Err(e) => {
-            // 注册失败 → M4 模式无法工作（若回退 GetCursorPos dx 模型，on_mac 期间
-            // 系统仍驱动物理 cursor，会触发上一版的"M4-A→M4-B→M4-A"死循环）。
-            // 不要悄悄退化；让进程退出，让用户先解决权限/会话问题再试。
             log::error!(
                 "M4 FATAL: RegisterRawInputDevices failed: {:?} -- \
-                 RIDEV_NOLEGACY 在某些 remote-desktop / Hyper-V enhanced session 下 \
-                 可能失败；请在本机物理控制台会话下运行",
+                 请在本机物理控制台会话下运行",
                 e
             );
+        }
+    }
+}
+
+/// 创建一个 message-only 隐藏窗口作为 raw input sink。
+///
+/// - `HWND_MESSAGE` parent = message-only window：永不被显示
+/// - `WS_EX_TOOLWINDOW`：不在任务栏
+/// - 窗口大小 0x0，无任何显示
+///
+/// windows crate 0.58 把 `PWSTR/PCWSTR`/`HINSTANCE` 字段用 wrapper 表达。
+unsafe extern "system" fn raw_input_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+fn create_message_only_sink() -> HWND {
+    unsafe {
+        let class_name = w!("CrosslinkRawInputSink");
+        let hinstance = match GetModuleHandleW(None) {
+            Ok(h) => h,
+            Err(e) => {
+                log::error!("M4 FATAL: GetModuleHandleW failed: {:?}", e);
+                return HWND(std::ptr::null_mut());
+            }
+        };
+
+        // RegisterClassExW 失败通常意味已注册；忽略返回（let _atom = ...）
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: windows::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES(0),
+            lpfnWndProc: Some(raw_input_wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinstance.into(),
+            hIcon: Default::default(),
+            hCursor: Default::default(),
+            hbrBackground: Default::default(),
+            lpszMenuName: windows::core::PCWSTR::null(),
+            lpszClassName: class_name,
+            hIconSm: Default::default(),
+        };
+        let _atom = RegisterClassExW(&wc);
+
+        match CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            class_name,
+            w!("CrosslinkRawInputSink"),
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            None,
+            hinstance,
+            None,
+        ) {
+            Ok(hwnd) => {
+                log::info!("M4: created raw input sink HWND {:?}", hwnd.0);
+                hwnd
+            }
+            Err(e) => {
+                log::error!(
+                    "M4 FATAL: CreateWindowExW failed: {:?} -- \
+                     raw input 不会到达本进程",
+                    e
+                );
+                HWND(std::ptr::null_mut())
+            }
         }
     }
 }

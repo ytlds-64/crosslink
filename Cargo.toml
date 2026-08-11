@@ -29,9 +29,11 @@ rand = "0.8"
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_System_LibraryLoader",
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",          # WNDCLASSEXW.HBR_BACKGROUND（HBRUSH）需要
 ] }
 
 # macOS 输入捕获 / 注入（CGEventTap / CGEventPost）。仅 macOS 目标编译，不影响 Win/Linux。
