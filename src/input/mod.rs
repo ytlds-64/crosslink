@@ -34,6 +34,9 @@ pub struct CaptureOptions {
     pub mac_w: Arc<AtomicU32>,
     pub mac_h: Arc<AtomicU32>,
     pub m4_mode: bool,
+    /// M4 fallback：true 时不再注册 raw input（用户机器 raw input 不到 buffer），
+    /// 改用 `GetCursorPos` 计算 dx 模型。
+    pub m4_fallback: bool,
 }
 
 #[cfg(target_os = "windows")]

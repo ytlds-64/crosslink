@@ -39,6 +39,7 @@ pub async fn run_server(
     switch_mode: bool,
     side: Side,
     m4_mode: bool,
+    m4_fallback: bool,
 ) -> Result<()> {
     let listener = TcpListener::bind((bind, port))
         .await
@@ -48,7 +49,7 @@ pub async fn run_server(
     loop {
         let (stream, peer) = listener.accept().await?;
         log::info!("accepted connection from {}", peer);
-        if let Err(e) = session_server(stream, key, name, enable_capture, test_input, switch_mode, side, m4_mode).await {
+        if let Err(e) = session_server(stream, key, name, enable_capture, test_input, switch_mode, side, m4_mode, m4_fallback).await {
             log::error!("session ended with error: {:?}", e);
         }
         log::info!("session closed, waiting for next connection");
@@ -88,6 +89,7 @@ async fn session_server(
     switch_mode: bool,
     side: Side,
     m4_mode: bool,
+    m4_fallback: bool,
 ) -> Result<()> {
     let (crypter, _fp) = crypto::server_handshake(&mut stream, key).await?;
     log::info!("handshake complete");
@@ -121,11 +123,19 @@ async fn session_server(
             mac_w: mac_w_atomic.clone(),
             mac_h: mac_h_atomic.clone(),
             m4_mode,
+            m4_fallback,
         });
         let etx_c = etx.clone();
         tokio::task::spawn_blocking(move || bridge_capture_to_tokio(std_rx, etx_c));
         if m4_mode {
-            log::info!("server: M4 seamless-cursor capture enabled (win={}x{})", my_w, my_h);
+            if m4_fallback {
+                log::info!(
+                    "server: M4 seamless-cursor capture enabled (win={}x{}, FALLBACK GetCursorPos dx)",
+                    my_w, my_h
+                );
+            } else {
+                log::info!("server: M4 seamless-cursor capture enabled (win={}x{})", my_w, my_h);
+            }
         } else {
             log::info!("server: keyboard+mouse capture → wire enabled");
         }

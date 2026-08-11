@@ -78,6 +78,19 @@ struct Cli {
     /// continuously, instead of just handing off ownership.
     #[arg(long)]
     m4: bool,
+
+    /// M4 fallback path. By default M4 uses Windows Raw Input API
+    /// (`GetRawInputBuffer`) to read the physical mouse delta, independent of the
+    /// cursor's visual position. On some Windows sessions (Hyper-V enhanced
+    /// console, certain RDP/AV combos, virtual mice) raw input does not reach the
+    /// process buffer even with a valid hidden HWND sink. In those environments
+    /// this flag forces M4 to fall back to the legacy `GetCursorPos` dx model —
+    /// `RIDEV_NOLEGACY` is **not** set (so OS does normal cursor tracking), the
+    /// invisible Win cursor is allowed to roam inside the Win screen, and `dx`
+    /// is computed from its position changes. The M4-C silent-wrap path is
+    /// removed so the cursor never visibly jumps to the left edge.
+    #[arg(long)]
+    m4_fallback: bool,
 }
 
 /// CLI 侧 `--side` 取值（clap ValueEnum），运行时映射为 `switch::Side`。
@@ -135,6 +148,7 @@ async fn main() -> Result<()> {
                 cli.switch,
                 side,
                 cli.m4,
+                cli.m4_fallback,
             )
             .await?;
         }
