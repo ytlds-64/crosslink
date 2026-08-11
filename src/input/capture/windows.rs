@@ -21,11 +21,10 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LRESULT, POINT, WPARAM, LPARAM
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateCursor, DispatchMessageW, GetCursorPos, GetMessageW, HHOOK, HCURSOR,
-    IDC_ARROW, KBDLLHOOKSTRUCT, LoadCursorW, MSG, OCR_NORMAL, SetCursorPos, SetSystemCursor,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, MSG,
+    SetCursorPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEWHEEL, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
 };
 
 use crate::input::event::{InputEvent, KeyEvent, KeyState, MouseButton, MouseEvent};
@@ -43,16 +42,14 @@ static ON_MAC_HOOK: AtomicBool = AtomicBool::new(false);
 static HOOKS_OK: AtomicBool = AtomicBool::new(false);
 static HOOK_TX: Mutex<Option<mpsc::Sender<CaptureMsg>>> = Mutex::new(None);
 
-// 透明光标隐藏状态（on_mac 期间隐藏 Win 系统光标）
-static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
-/// HCURSOR 内部是 `*mut c_void`（非 Send/Sync），包一层以便放进 static。
-struct SendCursor(HCURSOR);
-unsafe impl Send for SendCursor {}
-unsafe impl Sync for SendCursor {}
-static ORIG_ARROW: Mutex<Option<SendCursor>> = Mutex::new(None);
-/// 1x1 全透明光标：AND 掩码全 1（透明），XOR 掩码全 0。
-const TRANSPARENT_AND: [u8; 2] = [0xFF, 0x00];
-const TRANSPARENT_XOR: [u8; 2] = [0x00, 0x00];
+// （on_mac 期间 Win 光标仍然可见——这是我们故意接受的 UX 折中。）
+// 之前的 SetSystemCursor 透明光标方案虽然能把 Win 光标隐藏，但它是**全局系统资源**：
+// 一旦进程非正常退出（taskkill /F、电源断电、BSOD 等），改动会持续生效，整个系统
+// 的箭头光标都会变成透明。这是不可接受的"状态污染"。
+//
+// 现在的策略：完全不动系统光标资源。让 Win 光标在 on_mac 期间自由移动（用户能看到
+// 一个"幽灵光标"在 Win 屏上游走，但它不控制任何 Win app——hook 会吞掉所有按键/点击）。
+// 视觉上有点不优雅，但运行时干净，进程退出立刻回到原状。
 
 unsafe extern "system" fn low_level_kb_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && ON_MAC_HOOK.load(Ordering::Relaxed) {
@@ -60,6 +57,7 @@ unsafe extern "system" fn low_level_kb_proc(code: i32, wparam: WPARAM, lparam: L
         if let Some(hid) = keycodes::vk_to_hid(kbhs.vkCode as u16) {
             let is_down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let state = if is_down { KeyState::Pressed } else { KeyState::Released };
+            log::trace!("hook kb: vk=0x{:02X} hid=0x{:04X} state={:?} → forwarding", kbhs.vkCode, hid, state);
             if let Ok(g) = HOOK_TX.lock() {
                 if let Some(tx) = g.as_ref() {
                     let _ = tx.send(CaptureMsg::Input(InputEvent::Key(KeyEvent { hid, state })));
@@ -88,6 +86,7 @@ unsafe extern "system" fn low_level_mouse_proc(
                 };
                 let down = matches!(wp, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN);
                 let state = if down { KeyState::Pressed } else { KeyState::Released };
+                log::trace!("hook mouse: button={:?} state={:?} → forwarding & swallow", button, state);
                 if let Ok(g) = HOOK_TX.lock() {
                     if let Some(tx) = g.as_ref() {
                         let _ = tx.send(CaptureMsg::Input(InputEvent::Mouse(MouseEvent {
@@ -104,6 +103,12 @@ unsafe extern "system" fn low_level_mouse_proc(
                 // 滚轮暂不转发（MouseEvent 暂无 wheel 字段）；吞掉避免 Win 侧滚动。
                 return LRESULT(1);
             }
+            WM_MOUSEMOVE => {
+                // on_mac 期间让 move 事件 pass-through（不吞）——run_capture_loop 用
+                // GetCursorPos 算 dx_fb 需要看到 cursor 位置变化。
+                // 这样 Win 光标会"幽灵般"在屏内自由移动，但它不触发任何 Win app 的
+                // hover/click 响应（click 被前面的 arm 吞了，hover 仅为视觉噪声）。
+            }
             _ => {}
         }
     }
@@ -119,7 +124,6 @@ fn hook_thread(tx: mpsc::Sender<CaptureMsg>) {
             Ok(h) => h.into(),
             Err(e) => {
                 log::error!("M4 hook: GetModuleHandleW failed: {:?}", e);
-                set_system_cursor_hidden(false);
                 return;
             }
         };
@@ -151,63 +155,9 @@ fn hook_thread(tx: mpsc::Sender<CaptureMsg>) {
             let _ = UnhookWindowsHookEx(m);
         }
         HOOKS_OK.store(false, Ordering::Relaxed);
-        // 退出时恢复系统光标（若仍隐藏）
-        set_system_cursor_hidden(false);
-    }
-}
-
-/// 隐藏 / 恢复系统箭头光标（on_mac 期间让 Win 光标不可见）。
-fn set_system_cursor_hidden(hidden: bool) {
-    if hidden == CURSOR_HIDDEN.load(Ordering::Relaxed) {
-        return;
-    }
-    unsafe {
-        if hidden {
-            let hinst: HINSTANCE = match GetModuleHandleW(None) {
-                Ok(h) => h.into(),
-                Err(e) => {
-                    log::error!("M4: GetModuleHandleW failed (cursor hide): {:?}", e);
-                    return;
-                }
-            };
-            match LoadCursorW(None, IDC_ARROW) {
-                Ok(orig) => match CreateCursor(
-                    hinst,
-                    0,
-                    0,
-                    1,
-                    1,
-                    TRANSPARENT_AND.as_ptr() as *const core::ffi::c_void,
-                    TRANSPARENT_XOR.as_ptr() as *const core::ffi::c_void,
-                ) {
-                    Ok(trans) => {
-                        if SetSystemCursor(trans, OCR_NORMAL).is_ok() {
-                            *ORIG_ARROW.lock().unwrap() = Some(SendCursor(orig));
-                            CURSOR_HIDDEN.store(true, Ordering::Relaxed);
-                            log::info!("M4: system cursor hidden (transparent) while on Mac");
-                        } else {
-                            log::error!("M4: SetSystemCursor(hide) failed");
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("M4: CreateCursor failed: {:?}", e);
-                    }
-                },
-                Err(e) => {
-                    log::error!("M4: LoadCursorW(arrow) failed: {:?}", e);
-                }
-            }
-        } else {
-            let orig = ORIG_ARROW
-                .lock()
-                .unwrap()
-                .take()
-                .map(|c| c.0)
-                .unwrap_or_else(|| LoadCursorW(None, IDC_ARROW).unwrap_or(HCURSOR(std::ptr::null_mut())));
-            let _ = SetSystemCursor(orig, OCR_NORMAL);
-            CURSOR_HIDDEN.store(false, Ordering::Relaxed);
-            log::info!("M4: system cursor restored");
-        }
+        // 注意：不再做任何"恢复系统光标"的清理——我们不用 SetSystemCursor，
+        // 所以进程无论怎么退出（Ctrl+C / taskkill /F / 电源断）都不会留下
+        // 状态污染。这是用 UX 折中换可靠性。
     }
 }
 
@@ -350,7 +300,6 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
                 let dx_fb = p.x - last_x;
                 // M4-A: 光标进入 Win 最右列（且之前不在最右列）→ 切到 Mac
                 if have_pos && p.x >= win_w_i - 1 && dx_fb > 0 {
-                    set_system_cursor_hidden(true);
                     let _ = unsafe { SetCursorPos(0, p.y) };
                     on_mac = true;
                     ON_MAC_HOOK.store(true, Ordering::Relaxed);
@@ -381,7 +330,6 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
 
                 // M4-B: mac 光标在左缘且继续向左 → 回到 Win
                 if mac_cursor_x <= 0 && dx_fb < 0 {
-                    set_system_cursor_hidden(false);
                     let _ = unsafe { SetCursorPos(win_w_i - 1, p.y) };
                     on_mac = false;
                     ON_MAC_HOOK.store(false, Ordering::Relaxed);
