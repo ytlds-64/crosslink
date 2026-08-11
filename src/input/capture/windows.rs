@@ -1,318 +1,249 @@
 //! Windows 输入捕获（键盘 + 鼠标）。
 //!
-//! M2.2 实现键盘：基于 `GetAsyncKeyState` 的 5ms 轮询版本。
-//! M2.3 加入鼠标：按键用 `GetAsyncKeyState`（VK_LBUTTON/RBUTTON/MBUTTON），
-//!   相对位移用 `GetCursorPos` 计算两帧之间的差值。
-//! M4 加入无缝单光标：
-//!   - **Windows Raw Input API** 读取物理鼠标 delta，独立于 cursor 物理位置。
-//!   - **RIDEV_NOLEGACY**：禁用 normal cursor tracking，由我们自己用
-//!     `SetCursorPos` 驱动 cursor 物理位置。这避免了 on_mac 期间 cursor 在屏内
-//!     乱跑触发 M4-A/B/C 反复 fire。
-//!   - 在 `!on_mac` 期间：cursor 物理位置 = 旧位置 + raw input delta
-//!     （用 `SetCursorPos` 模拟 normal tracking）；当 cursor 到达 Win 右缘时
-//!     触发 M4-A。
-//!   - 在 `on_mac` 期间：cursor 物理钉在 (0, mac_pin_y)；mac_cursor_x 用 raw input
-//!     delta 累积；mac_cursor_x <= 0 + raw input 向左 → M4-B。
+//! M2.2 键盘：基于 `GetAsyncKeyState` 的 5ms 轮询版本。
+//! M2.3 鼠标：按键用 `GetAsyncKeyState`，相对位移用 `GetCursorPos` 帧差。
+//! M4 无缝单光标（Win 主控 Mac）：
+//!   - **低级别 hook（WH_KEYBOARD_LL + WH_MOUSE_LL）**：on_mac 期间吞掉
+//!     Win 侧按键 / 鼠标点击 / 滚轮（Win 前台程序不再响应），并把它们转发到 Mac。
+//!   - **鼠标位移**仍用 `GetCursorPos` 帧差（用户机器 raw input 环境不可用时的
+//!     已验证路径）：on_mac 期间让 Win 光标自由游走（不 pin、不 wrap），
+//!     dx/dy 反映真实物理移动。
+//!   - **光标隐藏**：用 `SetSystemCursor` 换成 1x1 全透明光标（替代无效的
+//!     `ShowCursor(FALSE)`），进入 Mac 时隐藏、返回 Win 时恢复。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use windows::core::w;
-use windows::Win32::Foundation::{HWND, LRESULT, POINT, WPARAM, LPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LRESULT, POINT, WPARAM, LPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::{
-    GetRawInputBuffer, GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_RELATIVE,
-    RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIDEV_NOLEGACY,
-    RIM_TYPEMOUSE,
-};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetCursorPos, PeekMessageW, RegisterClassExW, SetCursorPos,
-    ShowCursor, HWND_MESSAGE, MSG, PM_REMOVE, WNDCLASSEXW, WM_INPUT, WS_EX_TOOLWINDOW,
-    WS_OVERLAPPED,
+    CallNextHookEx, CreateCursor, DispatchMessageW, GetCursorPos, GetMessageW, HHOOK, HCURSOR,
+    IDC_ARROW, KBDLLHOOKSTRUCT, LoadCursorW, MSG, OCR_NORMAL, SetCursorPos, SetSystemCursor,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
 };
 
 use crate::input::event::{InputEvent, KeyEvent, KeyState, MouseButton, MouseEvent};
 use crate::input::keycodes;
 use crate::input::{CaptureMsg, CaptureOptions};
 
+// ── M4 低级别 hook 共享状态 ────────────────────────────────────────────────
+// 低级别 hook（WH_KEYBOARD_LL / WH_MOUSE_LL）在独立线程运行消息泵，回调在本进程
+// 上下文被调用。它们与 capture 主循环通过这些 static 通信：
+// - `ON_MAC_HOOK`：当前是否在 Mac 侧。hook 回调据此决定是否吞掉/转发输入；
+//   capture 主循环（run_capture_loop）在状态迁移时写入它。
+// - `HOOK_TX`：键盘/鼠标事件转发给 Mac 的发送端。
+// - `HOOKS_OK`：hook 是否安装成功（失败则降级：不吞事件，Win 会响应）。
+static ON_MAC_HOOK: AtomicBool = AtomicBool::new(false);
+static HOOKS_OK: AtomicBool = AtomicBool::new(false);
+static HOOK_TX: Mutex<Option<mpsc::Sender<CaptureMsg>>> = Mutex::new(None);
+
+// 透明光标隐藏状态（on_mac 期间隐藏 Win 系统光标）
+static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// HCURSOR 内部是 `*mut c_void`（非 Send/Sync），包一层以便放进 static。
+struct SendCursor(HCURSOR);
+unsafe impl Send for SendCursor {}
+unsafe impl Sync for SendCursor {}
+static ORIG_ARROW: Mutex<Option<SendCursor>> = Mutex::new(None);
+/// 1x1 全透明光标：AND 掩码全 1（透明），XOR 掩码全 0。
+const TRANSPARENT_AND: [u8; 2] = [0xFF, 0x00];
+const TRANSPARENT_XOR: [u8; 2] = [0x00, 0x00];
+
+unsafe extern "system" fn low_level_kb_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 && ON_MAC_HOOK.load(Ordering::Relaxed) {
+        let kbhs = *(lparam.0 as *const KBDLLHOOKSTRUCT);
+        if let Some(hid) = keycodes::vk_to_hid(kbhs.vkCode as u16) {
+            let is_down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+            let state = if is_down { KeyState::Pressed } else { KeyState::Released };
+            if let Ok(g) = HOOK_TX.lock() {
+                if let Some(tx) = g.as_ref() {
+                    let _ = tx.send(CaptureMsg::Input(InputEvent::Key(KeyEvent { hid, state })));
+                }
+            }
+        }
+        return LRESULT(1); // 吞掉：Win 前台程序不收此键
+    }
+    CallNextHookEx(HHOOK(std::ptr::null_mut()), code, wparam, lparam)
+}
+
+unsafe extern "system" fn low_level_mouse_proc(
+    code: i32,
+    wparam: WPARAM,
+    _lparam: LPARAM,
+) -> LRESULT {
+    if code >= 0 && ON_MAC_HOOK.load(Ordering::Relaxed) {
+        let wp = wparam.0 as u32;
+        match wp {
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP
+            | WM_MBUTTONDOWN | WM_MBUTTONUP => {
+                let button = match wp {
+                    WM_LBUTTONDOWN | WM_LBUTTONUP => MouseButton::Left,
+                    WM_RBUTTONDOWN | WM_RBUTTONUP => MouseButton::Right,
+                    _ => MouseButton::Middle,
+                };
+                let down = matches!(wp, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN);
+                let state = if down { KeyState::Pressed } else { KeyState::Released };
+                if let Ok(g) = HOOK_TX.lock() {
+                    if let Some(tx) = g.as_ref() {
+                        let _ = tx.send(CaptureMsg::Input(InputEvent::Mouse(MouseEvent {
+                            dx: 0,
+                            dy: 0,
+                            button: Some(button),
+                            state: Some(state),
+                        })));
+                    }
+                }
+                return LRESULT(1); // 吞掉：Win 不响应点击
+            }
+            WM_MOUSEWHEEL => {
+                // 滚轮暂不转发（MouseEvent 暂无 wheel 字段）；吞掉避免 Win 侧滚动。
+                return LRESULT(1);
+            }
+            _ => {}
+        }
+    }
+    CallNextHookEx(HHOOK(std::ptr::null_mut()), code, wparam, _lparam)
+}
+
+/// 运行低级别 hook 的线程：安装 hook + 泵消息（hook 回调需要线程有消息队列）。
+fn hook_thread(tx: mpsc::Sender<CaptureMsg>) {
+    *HOOK_TX.lock().unwrap() = Some(tx);
+    HOOKS_OK.store(false, Ordering::Relaxed);
+    unsafe {
+        let hinst: HINSTANCE = match GetModuleHandleW(None) {
+            Ok(h) => h.into(),
+            Err(e) => {
+                log::error!("M4 hook: GetModuleHandleW failed: {:?}", e);
+                set_system_cursor_hidden(false);
+                return;
+            }
+        };
+        let kb = SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_kb_proc), hinst, 0);
+        let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), hinst, 0);
+        match (&kb, &mouse) {
+            (Ok(_), Ok(_)) => {
+                HOOKS_OK.store(true, Ordering::Relaxed);
+                log::info!("M4: low-level input hooks installed (WH_KEYBOARD_LL + WH_MOUSE_LL)");
+            }
+            _ => {
+                log::error!(
+                    "M4 FATAL: low-level hook install failed: kb={:?} mouse={:?} \
+                     -- 点击/按键可能仍透传到 Win",
+                    kb.as_ref().err(),
+                    mouse.as_ref().err()
+                );
+            }
+        }
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            let _ = DispatchMessageW(&msg);
+        }
+        if let Ok(k) = kb {
+            let _ = UnhookWindowsHookEx(k);
+        }
+        if let Ok(m) = mouse {
+            let _ = UnhookWindowsHookEx(m);
+        }
+        HOOKS_OK.store(false, Ordering::Relaxed);
+        // 退出时恢复系统光标（若仍隐藏）
+        set_system_cursor_hidden(false);
+    }
+}
+
+/// 隐藏 / 恢复系统箭头光标（on_mac 期间让 Win 光标不可见）。
+fn set_system_cursor_hidden(hidden: bool) {
+    if hidden == CURSOR_HIDDEN.load(Ordering::Relaxed) {
+        return;
+    }
+    unsafe {
+        if hidden {
+            let hinst: HINSTANCE = match GetModuleHandleW(None) {
+                Ok(h) => h.into(),
+                Err(e) => {
+                    log::error!("M4: GetModuleHandleW failed (cursor hide): {:?}", e);
+                    return;
+                }
+            };
+            match LoadCursorW(None, IDC_ARROW) {
+                Ok(orig) => match CreateCursor(
+                    hinst,
+                    0,
+                    0,
+                    1,
+                    1,
+                    TRANSPARENT_AND.as_ptr() as *const core::ffi::c_void,
+                    TRANSPARENT_XOR.as_ptr() as *const core::ffi::c_void,
+                ) {
+                    Ok(trans) => {
+                        if SetSystemCursor(trans, OCR_NORMAL).is_ok() {
+                            *ORIG_ARROW.lock().unwrap() = Some(SendCursor(orig));
+                            CURSOR_HIDDEN.store(true, Ordering::Relaxed);
+                            log::info!("M4: system cursor hidden (transparent) while on Mac");
+                        } else {
+                            log::error!("M4: SetSystemCursor(hide) failed");
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("M4: CreateCursor failed: {:?}", e);
+                    }
+                },
+                Err(e) => {
+                    log::error!("M4: LoadCursorW(arrow) failed: {:?}", e);
+                }
+            }
+        } else {
+            let orig = ORIG_ARROW
+                .lock()
+                .unwrap()
+                .take()
+                .map(|c| c.0)
+                .unwrap_or_else(|| LoadCursorW(None, IDC_ARROW).unwrap_or(HCURSOR(std::ptr::null_mut())));
+            let _ = SetSystemCursor(orig, OCR_NORMAL);
+            CURSOR_HIDDEN.store(false, Ordering::Relaxed);
+            log::info!("M4: system cursor restored");
+        }
+    }
+}
+
 /// 启动输入捕获（键盘 + 鼠标），返回事件 channel 的接收端。
 pub fn start_capture(opts: CaptureOptions) -> Receiver<CaptureMsg> {
-    if opts.m4_mode && !opts.m4_fallback {
-        // M4：注册 raw input 鼠标，禁用 normal cursor tracking（我们自己驱动）。
-        register_raw_input_mouse();
-    }
     let (tx, rx) = mpsc::channel();
+    if opts.m4_mode {
+        // M4：hook 线程吞掉 on_mac 期间的 Win 输入并转发；主循环用 GetCursorPos
+        // 计算位移 + 驱动逻辑光标。--m4-fallback 不再需要单独处理（统一走此模型）。
+        let tx_hook = tx.clone();
+        thread::spawn(move || hook_thread(tx_hook));
+    }
     thread::spawn(move || run_capture_loop(tx, opts));
     rx
 }
 
-fn register_raw_input_mouse() {
-    // M4 必须用 raw input 读取鼠标 delta（与 cursor 物理位置解耦）。
-    //
-    // **关键约束（MSDN + 翻车总结）**：
-    // 1. `RegisterRawInputDevices` 的 `hwndTarget` 必须是 **valid HWND**。
-    //    console app 没窗口时，OS 不知道把 raw-input 数据 dispatch 到哪个 thread，
-    //    → `GetRawInputBuffer` 永远返 0 / size=0，raw input 根本不到。
-    // 2. `RIDEV_INPUTSINK` 才允许 raw input 在 **non-foreground** thread/window 收。
-    //    没它 → 仅前台窗口收 → 一旦 other 端接管（cursor 在 Mac），Win 端即使未失焦
-    //    也会因为 power-toys / IDE 占焦点收不到 raw input — M4 永久卡死。
-    //
-    // flags 选择：`RIDEV_INPUTSINK | RIDEV_NOLEGACY`
-    // - `RIDEV_NOLEGACY`：禁用 WM_INPUT/WM_MOUSEMOVE 路径，自己用 SetCursorPos 驱动
-    //   cursor 物理位置。
-    // - `RIDEV_INPUTSINK`：即便 PowerShell/IDE 占焦点，raw input 仍到本 thread。
-    //
-    // 修法（e05d167+）：创建 **message-only hidden window** 作为 hwndTarget。
-    //   - hwndTarget 有效（不是 NULL）
-    //   - raw-input buffer 派发到本 thread
-    //   - 窗口隐藏 + WS_EX_TOOLWINDOW，**绝不会被用户看到**
-    let hwnd = create_message_only_sink();
-
-    let rid = RAWINPUTDEVICE {
-        usUsagePage: 0x01,
-        usUsage: 0x02,
-        dwFlags: RIDEV_NOLEGACY | RIDEV_INPUTSINK,
-        hwndTarget: hwnd,
-    };
-    let size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
-    let result = unsafe { RegisterRawInputDevices(&[rid], size) };
-    match result {
-        Ok(_) => log::info!(
-            "M4: raw input mouse registered (RIDEV_NOLEGACY | RIDEV_INPUTSINK, hwnd={:?})",
-            hwnd.0
-        ),
-        Err(e) => {
-            log::error!(
-                "M4 FATAL: RegisterRawInputDevices failed: {:?} -- \
-                 请在本机物理控制台会话下运行",
-                e
-            );
-        }
+/// 把 `delta` 从 `from` 分辨率等比映射到 `to` 分辨率（0 时退化为 1:1）。
+fn map_axis(delta: i64, from: u32, to: u32) -> i64 {
+    if from == 0 || to == 0 {
+        return delta;
     }
-}
-
-/// 创建一个 message-only 隐藏窗口作为 raw input sink。
-///
-/// - `HWND_MESSAGE` parent = message-only window：永不被显示
-/// - `WS_EX_TOOLWINDOW`：不在任务栏
-/// - 窗口大小 0x0，无任何显示
-///
-/// windows crate 0.58 把 `PWSTR/PCWSTR`/`HINSTANCE` 字段用 wrapper 表达。
-unsafe extern "system" fn raw_input_wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-fn create_message_only_sink() -> HWND {
-    unsafe {
-        let class_name = w!("CrosslinkRawInputSink");
-        let hinstance = match GetModuleHandleW(None) {
-            Ok(h) => h,
-            Err(e) => {
-                log::error!("M4 FATAL: GetModuleHandleW failed: {:?}", e);
-                return HWND(std::ptr::null_mut());
-            }
-        };
-
-        // RegisterClassExW 失败通常意味已注册；忽略返回（let _atom = ...）
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: windows::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES(0),
-            lpfnWndProc: Some(raw_input_wnd_proc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: hinstance.into(),
-            hIcon: Default::default(),
-            hCursor: Default::default(),
-            hbrBackground: Default::default(),
-            lpszMenuName: windows::core::PCWSTR::null(),
-            lpszClassName: class_name,
-            hIconSm: Default::default(),
-        };
-        let _atom = RegisterClassExW(&wc);
-
-        match CreateWindowExW(
-            WS_EX_TOOLWINDOW,
-            class_name,
-            w!("CrosslinkRawInputSink"),
-            WS_OVERLAPPED,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            None,
-            hinstance,
-            None,
-        ) {
-            Ok(hwnd) => {
-                log::info!("M4: created raw input sink HWND {:?}", hwnd.0);
-                hwnd
-            }
-            Err(e) => {
-                log::error!(
-                    "M4 FATAL: CreateWindowExW failed: {:?} -- \
-                     raw input 不会到达本进程",
-                    e
-                );
-                HWND(std::ptr::null_mut())
-            }
-        }
-    }
-}
-
-/// Poll raw mouse delta via **two independent paths** and return their sum.
-///
-/// Why two paths: in some Win11 / console / Hyper-V / RDP sessions,
-/// `GetRawInputBuffer` (kernel-level polling) returns size=0 even with a
-/// valid hidden HWND sink, but `PeekMessage(WM_INPUT)` (the user-level
-/// message queue) does deliver events for the same sink. They are *not*
-/// equivalent on every session. We pump both.
-///
-/// Returns `(dx, dy, stats)` so the caller can periodically log whether
-/// raw input actually reached the process — that diagnostic has been the
-/// smoking gun in every prior M4 failure ("did `RIDEV_INPUTSINK` work?")
-#[derive(Default, Debug, Clone, Copy)]
-struct RawMouseStats {
-    poll_count: u64,
-    buf_size_last: u32,
-    buf_size_max: u32,
-    buf_count_last: u32,
-    msg_count: u32,
-    msg_max: u32,
-    total_dx: i64,
-    total_dy: i64,
-}
-
-fn drain_raw_mouse(hwnd: HWND, stats: &mut RawMouseStats) -> (i64, i64) {
-    stats.poll_count += 1;
-    let mut dx: i64 = 0;
-    let mut dy: i64 = 0;
-
-    // Path 1: GetRawInputBuffer (kernel-level polling)
-    let header_size = std::mem::size_of::<RAWINPUTHEADER>() as u32;
-    let mut size: u32 = 0;
-    let _ = unsafe { GetRawInputBuffer(None, &mut size, header_size) };
-    stats.buf_size_last = size;
-    if size > stats.buf_size_max {
-        stats.buf_size_max = size;
-    }
-    if size > 0 {
-        let mut buffer = vec![0u8; size as usize];
-        let count = unsafe {
-            GetRawInputBuffer(
-                Some(buffer.as_mut_ptr() as *mut RAWINPUT),
-                &mut size,
-                header_size,
-            )
-        };
-        stats.buf_count_last = count;
-        if count != u32::MAX && count > 0 {
-            let mut offset: usize = 0;
-            for _ in 0..count {
-                let raw: &RAWINPUT = unsafe { &*(buffer.as_ptr().add(offset) as *const RAWINPUT) };
-                if raw.header.dwType == RIM_TYPEMOUSE.0 as u32 {
-                    let mouse = unsafe { raw.data.mouse };
-                    if mouse.usFlags.0 & MOUSE_MOVE_RELATIVE.0 != 0 {
-                        dx += mouse.lLastX as i64;
-                        dy += mouse.lLastY as i64;
-                    }
-                }
-                offset += raw.header.dwSize as usize;
-                if offset >= buffer.len() {
-                    break;
-                }
-            }
-        }
-    }
-
-    // Path 2: PeekMessage(WM_INPUT) (user-level message queue)
-    let mut msg = MSG::default();
-    unsafe {
-        let mut msg_count_this = 0u32;
-        while PeekMessageW(&mut msg, hwnd, WM_INPUT, WM_INPUT, PM_REMOVE).as_bool() {
-            let mut raw: RAWINPUT = std::mem::zeroed();
-            let mut raw_size = std::mem::size_of::<RAWINPUT>() as u32;
-            // msg.lParam 在 WM_INPUT 里就是 HRAWINPUT
-            let hraw = HRAWINPUT(msg.lParam.0 as *mut std::ffi::c_void);
-            let result = GetRawInputData(
-                hraw,
-                RID_INPUT,
-                Some(&mut raw as *mut _ as *mut _),
-                &mut raw_size,
-                std::mem::size_of::<RAWINPUTHEADER>() as u32,
-            );
-            if result != u32::MAX && raw.header.dwType == RIM_TYPEMOUSE.0 as u32 {
-                let mouse = raw.data.mouse;
-                if mouse.usFlags.0 & MOUSE_MOVE_RELATIVE.0 != 0 {
-                    dx += mouse.lLastX as i64;
-                    dy += mouse.lLastY as i64;
-                }
-            }
-            msg_count_this += 1;
-        }
-        stats.msg_count += msg_count_this as u32;
-        if msg_count_this > stats.msg_max {
-            stats.msg_max = msg_count_this;
-        }
-    }
-
-    stats.total_dx += dx;
-    stats.total_dy += dy;
-    (dx, dy)
-}
-
-fn set_cursor_visible(visible: bool) {
-    unsafe {
-        if visible {
-            while ShowCursor(windows::Win32::Foundation::BOOL(1)) < 0 {}
-        } else {
-            while ShowCursor(windows::Win32::Foundation::BOOL(0)) >= 0 {}
-        }
-    }
-}
-
-fn map_y(win_y: i64, win_h: u32, mac_h: u32) -> i64 {
-    if mac_h == 0 || win_h == 0 {
-        return win_y;
-    }
-    ((win_y as f64 / win_h as f64) * mac_h as f64) as i64
+    ((delta as f64) * (to as f64) / (from as f64)) as i64
 }
 
 fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
     log::info!(
-        "input capture: started (Windows, 5ms poll, m4={}, fallback={}, win={}x{})",
+        "input capture: started (Windows, m4={}, fallback_flag={}, win={}x{})",
         opts.m4_mode,
         opts.m4_fallback,
         opts.win_w,
         opts.win_h,
     );
 
-    // M4 raw input path：重用 register_raw_input_mouse 创建的 hidden HWND。
-    let raw_hwnd: HWND = if opts.m4_mode && !opts.m4_fallback {
-        // 注册 raw input 时已创建。下面再创建一次不会有问题
-        // （CreateWindowExW 失败时返 Err），但为了避免重复创建的开销，
-        // 这里改用同步方式：直接调一次相同的 create 函数。
-        let h = create_message_only_sink();
-        log::info!("M4: raw input sink HWND ready: {:?}", h.0);
-        h
-    } else {
-        HWND(std::ptr::null_mut())
-    };
-
-    // 既然 RAWINPUTDEVICE 已经成功注册到 raw_hwnd（register_raw_input_mouse
-    // 已在 start_capture 早先调用），我们这里不再重复注册。
-
+    // M2/M3 模式状态
     let mut prev_keys: [bool; 256] = [false; 256];
     let mut prev_btn = [false; 3];
-
-    // M2 模式下的 cursor 位置追踪
     let mut last_pos = POINT { x: 0, y: 0 };
     let mut have_pos = false;
 
@@ -320,64 +251,57 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
     let mut on_mac = false;
     let mut mac_cursor_x: i64 = 0;
     let mut mac_cursor_y: i64 = 0;
-    let mut mac_pin_y: i32 = 0; // on_mac 期间 cursor 钉住的 y
     let mut last_sent_x: i64 = -1;
     let mut last_sent_y: i64 = -1;
-    let mut last_stream = std::time::Instant::now();
-
-    // raw input 统计（每 200 帧打一次 INFO 日志）
-    let mut raw_stats = RawMouseStats::default();
-    let mut stats_tick: u64 = 0;
+    let mut last_stream = Instant::now();
 
     let win_w_i = opts.win_w as i32;
-    let win_h_i = opts.win_h as i32;
+
+    let mut hooks_warned = false;
 
     loop {
-        // ---- 键盘 ----
-        for vk in 0u16..256 {
-            let state = unsafe { GetAsyncKeyState(vk as i32) };
-            let down = (state as u16 & 0x8000) != 0;
-            let idx = vk as usize;
-            if down != prev_keys[idx] {
-                prev_keys[idx] = down;
-                if let Some(hid) = keycodes::vk_to_hid(vk) {
-                    let state = if down { KeyState::Pressed } else { KeyState::Released };
-                    if !(opts.m4_mode && !on_mac) {
-                        let ev = InputEvent::Key(KeyEvent { hid, state });
+        // ---- 键盘 / 鼠标按键（仅非 M4 模式转发；M4 的 on_mac 转发由 hook 负责）----
+        if !opts.m4_mode {
+            for vk in 0u16..256 {
+                let state = unsafe { GetAsyncKeyState(vk as i32) };
+                let down = (state as u16 & 0x8000) != 0;
+                let idx = vk as usize;
+                if down != prev_keys[idx] {
+                    prev_keys[idx] = down;
+                    if let Some(hid) = keycodes::vk_to_hid(vk) {
+                        let st = if down { KeyState::Pressed } else { KeyState::Released };
+                        let ev = InputEvent::Key(KeyEvent { hid, state: st });
                         if tx.send(CaptureMsg::Input(ev)).is_err() {
                             log::info!("input capture: receiver dropped, stopping");
                             return;
                         }
+                    } else if down {
+                        log::trace!("input capture: unmapped VK 0x{:02X} (release skipped)", vk);
                     }
-                } else if down {
-                    log::trace!("input capture: unmapped VK 0x{:02X} (release skipped)", vk);
                 }
             }
-        }
 
-        // ---- 鼠标按键 ----
-        const BTN_VK: [i32; 3] = [
-            0x01, // VK_LBUTTON
-            0x02, // VK_RBUTTON
-            0x04, // VK_MBUTTON
-        ];
-        for (i, &vk) in BTN_VK.iter().enumerate() {
-            let state = unsafe { GetAsyncKeyState(vk) };
-            let down = (state as u16 & 0x8000) != 0;
-            if down != prev_btn[i] {
-                prev_btn[i] = down;
-                let button = match i {
-                    0 => MouseButton::Left,
-                    1 => MouseButton::Right,
-                    _ => MouseButton::Middle,
-                };
-                let state = if down { KeyState::Pressed } else { KeyState::Released };
-                if !(opts.m4_mode && !on_mac) {
+            const BTN_VK: [i32; 3] = [
+                0x01, // VK_LBUTTON
+                0x02, // VK_RBUTTON
+                0x04, // VK_MBUTTON
+            ];
+            for (i, &vk) in BTN_VK.iter().enumerate() {
+                let state = unsafe { GetAsyncKeyState(vk) };
+                let down = (state as u16 & 0x8000) != 0;
+                if down != prev_btn[i] {
+                    prev_btn[i] = down;
+                    let button = match i {
+                        0 => MouseButton::Left,
+                        1 => MouseButton::Right,
+                        _ => MouseButton::Middle,
+                    };
+                    let st = if down { KeyState::Pressed } else { KeyState::Released };
                     let ev = InputEvent::Mouse(MouseEvent {
                         dx: 0,
                         dy: 0,
                         button: Some(button),
-                        state: Some(state),
+                        state: Some(st),
                     });
                     if tx.send(CaptureMsg::Input(ev)).is_err() {
                         log::info!("input capture: receiver dropped, stopping");
@@ -388,253 +312,110 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
         }
 
         if opts.m4_mode {
-            use std::sync::atomic::Ordering;
+            if !HOOKS_OK.load(Ordering::Relaxed) && !hooks_warned {
+                log::warn!("M4: input hooks not installed -- Win 点击/按键可能仍透传到 Win");
+                hooks_warned = true;
+            }
             let mac_w = opts.mac_w.load(Ordering::Relaxed);
             let mac_h = opts.mac_h.load(Ordering::Relaxed);
-
-            // 每帧读 raw input（两条路径：buffer + WM_INPUT message queue）
-            let (raw_dx, raw_dy) = if opts.m4_fallback {
-                (0, 0) // fallback 不读 raw input
-            } else {
-                drain_raw_mouse(raw_hwnd, &mut raw_stats)
-            };
 
             let mut p = POINT { x: 0, y: 0 };
             let _ = unsafe { GetCursorPos(&mut p) };
 
             if !on_mac {
-                if opts.m4_fallback {
-                    // fallback：cursor 走 normal tracking，我们只做条件检测
-                    // （不主动 SetCursorPos，避免破坏 OS tracking）
-                    let last_x = last_pos.x;
-                    let dx_fb = p.x - last_x;
-                    // M4-A: cursor 到达右缘 + 向右推 → 进 Mac
-                    if p.x >= win_w_i - 1 && dx_fb > 0 {
-                        set_cursor_visible(false);
-                        let _ = unsafe { SetCursorPos(0, p.y) };
-                        on_mac = true;
-                        mac_pin_y = p.y;
-                        mac_cursor_x = 0;
-                        mac_cursor_y = map_y(p.y as i64, opts.win_h, mac_h);
-                        let _ = tx.send(CaptureMsg::CursorState {
-                            on_mac: true,
-                            x: 0,
-                            y: mac_cursor_y.clamp(0, mac_h as i64) as u32,
-                        });
-                        log::info!(
-                            "m4[FALLBACK]: enter Mac region at win_y={}, mapped mac_y={}",
-                            p.y,
-                            mac_cursor_y
-                        );
-                        last_pos = POINT { x: 0, y: p.y };
-                        have_pos = true;
-                        last_sent_x = -1;
-                        last_sent_y = -1;
-                        last_stream = std::time::Instant::now();
-                        continue;
-                    }
-                } else {
-                    // raw input 路径：用 raw_dx 主动驱动 cursor
-                    if raw_dx != 0 || raw_dy != 0 {
-                        let new_x = (p.x as i64 + raw_dx).clamp(0, win_w_i as i64 - 1) as i32;
-                        let new_y = (p.y as i64 + raw_dy).clamp(0, win_h_i as i64 - 1) as i32;
-                        let _ = unsafe { SetCursorPos(new_x, new_y) };
-                        p = POINT { x: new_x, y: new_y };
-                    }
-                    // M4-A: cursor 到达右缘 + raw_dx > 0 → 进 Mac
-                    if p.x >= win_w_i - 1 && raw_dx > 0 {
-                        set_cursor_visible(false);
-                        let _ = unsafe { SetCursorPos(0, p.y) };
-                        on_mac = true;
-                        mac_pin_y = p.y;
-                        mac_cursor_x = 0;
-                        mac_cursor_y = map_y(p.y as i64, opts.win_h, mac_h);
-                        let _ = tx.send(CaptureMsg::CursorState {
-                            on_mac: true,
-                            x: 0,
-                            y: mac_cursor_y.clamp(0, mac_h as i64) as u32,
-                        });
-                        log::info!(
-                            "m4: enter Mac region at win_y={}, mapped mac_y={}",
-                            p.y,
-                            mac_cursor_y
-                        );
-                        last_sent_x = -1;
-                        last_sent_y = -1;
-                        last_stream = std::time::Instant::now();
-                        continue;
-                    }
+                let last_x = last_pos.x;
+                let dx_fb = p.x - last_x;
+                // M4-A: 光标进入 Win 最右列（且之前不在最右列）→ 切到 Mac
+                if have_pos && p.x >= win_w_i - 1 && dx_fb > 0 {
+                    set_system_cursor_hidden(true);
+                    let _ = unsafe { SetCursorPos(0, p.y) };
+                    on_mac = true;
+                    ON_MAC_HOOK.store(true, Ordering::Relaxed);
+                    mac_cursor_x = 0;
+                    mac_cursor_y = map_axis(p.y as i64, opts.win_h, mac_h);
+                    let _ = tx.send(CaptureMsg::CursorState {
+                        on_mac: true,
+                        x: 0,
+                        y: mac_cursor_y.clamp(0, mac_h as i64) as u32,
+                    });
+                    log::info!(
+                        "m4: enter Mac region at win_y={}, mapped mac_y={}",
+                        p.y,
+                        mac_cursor_y
+                    );
+                    last_pos = POINT { x: 0, y: p.y };
+                    have_pos = true;
+                    last_sent_x = -1;
+                    last_sent_y = -1;
+                    last_stream = Instant::now();
+                    continue;
                 }
             } else {
-                // on_mac=true
-                if opts.m4_fallback {
-                    // fallback：cursor 已被 SetCursorPos(0, p.y) 钉住，
-                    // OS 仍 normal tracking（它会推 invisible cursor）。
-                    // 我们让 cursor 自由在屏内被推，靠 GetCursorPos 算 dx。
-                    let last_x = if have_pos { last_pos.x } else { 0 };
-                    let last_y = if have_pos { last_pos.y } else { p.y };
-                    let dx_fb = p.x - last_x;
-                    let dy_fb = p.y - last_y;
+                let last_x = if have_pos { last_pos.x } else { p.x };
+                let last_y = if have_pos { last_pos.y } else { p.y };
+                let dx_fb = p.x - last_x;
+                let dy_fb = p.y - last_y;
 
-                    // 每帧 force-hide（应对 ShowCursor(FALSE) 不稳定）
-                    unsafe {
-                        loop {
-                            let n = ShowCursor(windows::Win32::Foundation::BOOL(0));
-                            if n < 0 { break; }
-                        }
-                    }
-
-                    // 不主动 SetCursorPos，让 OS tracking cursor 自由移动
-                    // (这样 GetCursorPos 能反映真实 dx)
-
-                    // M4-B: mac_cursor_x <= 0 + dx_fb < 0 → 回 Win
-                    if mac_cursor_x <= 0 && dx_fb < 0 {
-                        set_cursor_visible(true);
-                        let _ = unsafe { SetCursorPos(win_w_i - 1, p.y) };
-                        on_mac = false;
-                        let _ = tx.send(CaptureMsg::CursorState {
-                            on_mac: false,
-                            x: 0,
-                            y: 0,
-                        });
-                        log::info!("m4[FALLBACK]: return to Win region at win_y={}", p.y);
-                        last_pos = POINT { x: win_w_i - 1, y: p.y };
-                        have_pos = true;
-                        last_sent_x = -1;
-                        last_sent_y = -1;
-                        last_stream = std::time::Instant::now();
-                        continue;
-                    }
-
-                    // M4-D: 累积 mac_cursor
-                    if dx_fb != 0 || dy_fb != 0 {
-                        mac_cursor_x += dx_fb as i64;
-                        mac_cursor_y += map_y(dy_fb as i64, opts.win_h, mac_h);
-                        let new_x = mac_cursor_x.clamp(0, mac_w as i64);
-                        let new_y = mac_cursor_y.clamp(0, mac_h as i64);
-                        // 钉在 clamp 值，避免反向反弹累积失真
-                        if new_x == 0 {
-                            mac_cursor_x = 0;
-                        } else if new_x == mac_w as i64 {
-                            mac_cursor_x = mac_w as i64;
-                        }
-                        if new_y == 0 {
-                            mac_cursor_y = 0;
-                        } else if new_y == mac_h as i64 {
-                            mac_cursor_y = mac_h as i64;
-                        }
-
-                        let now = std::time::Instant::now();
-                        let since = now.duration_since(last_stream);
-                        if (new_x != last_sent_x || new_y != last_sent_y)
-                            && since >= std::time::Duration::from_millis(16)
-                        {
-                            let _ = tx.send(CaptureMsg::CursorState {
-                                on_mac: true,
-                                x: new_x as u32,
-                                y: new_y as u32,
-                            });
-                            last_sent_x = new_x;
-                            last_sent_y = new_y;
-                            last_stream = now;
-                            log::trace!(
-                                "m4 stream[FALLBACK]: dx={} dy={} mac=({}, {})",
-                                dx_fb,
-                                dy_fb,
-                                new_x,
-                                new_y
-                            );
-                        }
-                    }
-                    last_pos = p;
+                // M4-B: mac 光标在左缘且继续向左 → 回到 Win
+                if mac_cursor_x <= 0 && dx_fb < 0 {
+                    set_system_cursor_hidden(false);
+                    let _ = unsafe { SetCursorPos(win_w_i - 1, p.y) };
+                    on_mac = false;
+                    ON_MAC_HOOK.store(false, Ordering::Relaxed);
+                    let _ = tx.send(CaptureMsg::CursorState {
+                        on_mac: false,
+                        x: 0,
+                        y: 0,
+                    });
+                    log::info!("m4: return to Win region at win_y={}", p.y);
+                    last_pos = POINT { x: win_w_i - 1, y: p.y };
                     have_pos = true;
-                } else {
-                    // raw input 路径：cursor 物理钉在 (0, mac_pin_y)，用 raw input 累积
-                    if p.x != 0 || p.y != mac_pin_y {
-                        let _ = unsafe { SetCursorPos(0, mac_pin_y) };
+                    last_sent_x = -1;
+                    last_sent_y = -1;
+                    last_stream = Instant::now();
+                    continue;
+                }
+
+                // M4-D: 累积 mac 光标（GetCursorPos 反映真实相对位移）
+                if dx_fb != 0 || dy_fb != 0 {
+                    mac_cursor_x += map_axis(dx_fb as i64, opts.win_w, mac_w);
+                    mac_cursor_y += map_axis(dy_fb as i64, opts.win_h, mac_h);
+                    let new_x = mac_cursor_x.clamp(0, mac_w as i64);
+                    let new_y = mac_cursor_y.clamp(0, mac_h as i64);
+                    if new_x == 0 {
+                        mac_cursor_x = 0;
+                    } else if new_x == mac_w as i64 {
+                        mac_cursor_x = mac_w as i64;
+                    }
+                    if new_y == 0 {
+                        mac_cursor_y = 0;
+                    } else if new_y == mac_h as i64 {
+                        mac_cursor_y = mac_h as i64;
                     }
 
-                    // 每帧 force-hide
-                    unsafe {
-                        loop {
-                            let n = ShowCursor(windows::Win32::Foundation::BOOL(0));
-                            if n < 0 { break; }
-                        }
-                    }
-
-                    // M4-B: mac_cursor_x <= 0 + raw_dx < 0 → 回 Win
-                    if mac_cursor_x <= 0 && raw_dx < 0 {
-                        set_cursor_visible(true);
-                        let _ = unsafe { SetCursorPos(win_w_i - 1, p.y) };
-                        on_mac = false;
+                    let now = Instant::now();
+                    if (new_x != last_sent_x || new_y != last_sent_y)
+                        && now.duration_since(last_stream) >= Duration::from_millis(16)
+                    {
                         let _ = tx.send(CaptureMsg::CursorState {
-                            on_mac: false,
-                            x: 0,
-                            y: 0,
+                            on_mac: true,
+                            x: new_x as u32,
+                            y: new_y as u32,
                         });
-                        log::info!("m4: return to Win region at win_y={}", p.y);
-                        last_sent_x = -1;
-                        last_sent_y = -1;
-                        last_stream = std::time::Instant::now();
-                        continue;
-                    }
-
-                    // M4-D: 用 raw input delta 累积 mac_cursor
-                    if raw_dx != 0 || raw_dy != 0 {
-                        mac_cursor_x += raw_dx;
-                        mac_cursor_y += map_y(raw_dy, opts.win_h, mac_h);
-                        let new_x = mac_cursor_x.clamp(0, mac_w as i64);
-                        let new_y = mac_cursor_y.clamp(0, mac_h as i64);
-                        if new_x == 0 {
-                            mac_cursor_x = 0;
-                        } else if new_x == mac_w as i64 {
-                            mac_cursor_x = mac_w as i64;
-                        }
-                        if new_y == 0 {
-                            mac_cursor_y = 0;
-                        } else if new_y == mac_h as i64 {
-                            mac_cursor_y = mac_h as i64;
-                        }
-
-                        let now = std::time::Instant::now();
-                        let since = now.duration_since(last_stream);
-                        if (new_x != last_sent_x || new_y != last_sent_y)
-                            && since >= std::time::Duration::from_millis(16)
-                        {
-                            let _ = tx.send(CaptureMsg::CursorState {
-                                on_mac: true,
-                                x: new_x as u32,
-                                y: new_y as u32,
-                            });
-                            last_sent_x = new_x;
-                            last_sent_y = new_y;
-                            last_stream = now;
-                            log::trace!(
-                                "m4 stream: raw_dx={} raw_dy={} mac=({}, {})",
-                                raw_dx,
-                                raw_dy,
-                                new_x,
-                                new_y
-                            );
-                        }
+                        last_sent_x = new_x;
+                        last_sent_y = new_y;
+                        last_stream = now;
+                        log::trace!(
+                            "m4 stream: dx={} dy={} mac=({}, {})",
+                            dx_fb,
+                            dy_fb,
+                            new_x,
+                            new_y
+                        );
                     }
                 }
-            }
-
-            // 周期性 stats 日志（每 200 帧 ≈ 1 秒打一次；用户可见 raw input 状态）
-            stats_tick += 1;
-            if stats_tick % 200 == 0 && !opts.m4_fallback {
-                log::info!(
-                    "m4 raw stats: poll={} buf_size_last={} buf_size_max={} buf_count_last={} msg_count={} msg_max={} total_dx={} total_dy={}",
-                    raw_stats.poll_count,
-                    raw_stats.buf_size_last,
-                    raw_stats.buf_size_max,
-                    raw_stats.buf_count_last,
-                    raw_stats.msg_count,
-                    raw_stats.msg_max,
-                    raw_stats.total_dx,
-                    raw_stats.total_dy
-                );
+                last_pos = p;
+                have_pos = true;
             }
         } else {
             // M2/M3 默认模式：用 GetCursorPos 计算 dx 转发
