@@ -21,7 +21,7 @@ use std::time::Duration;
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::UI::Input::{
     GetRawInputBuffer, RegisterRawInputDevices, MOUSE_MOVE_RELATIVE, RAWINPUT, RAWINPUTDEVICE,
-    RAWINPUTHEADER, RIDEV_INPUTSINK, RIDEV_NOLEGACY, RIM_TYPEMOUSE,
+    RAWINPUTHEADER, RIDEV_NOLEGACY, RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos, ShowCursor};
@@ -42,18 +42,39 @@ pub fn start_capture(opts: CaptureOptions) -> Receiver<CaptureMsg> {
 }
 
 fn register_raw_input_mouse() {
+    // M4 必须用 raw input 读取鼠标 delta（与 cursor 物理位置解耦）。
+    //
+    // flags 选择：
+    // - `RIDEV_NOLEGACY`：禁用 WM_INPUT/WM_MOUSEMOVE 路径，我们自己用 SetCursorPos
+    //   驱动 cursor 物理位置。如果不设，光标会同时被系统和我们的 SetCursorPos 抢。
+    // - **不要**加 `RIDEV_INPUTSINK`：INPUTSINK 要求 `hwndTarget` 是有效窗口句柄，
+    //   NULL 直接 `E_INVALIDARG`；并且 M4 也不需要——Win 端是 owner 时必然前台，
+    //   进 Mac 后 Win 端正好该静音。
+    //
+    // 注意：cursor 在前缘 (`x = win_w - 1`) 时，**不能**用 ClipCursor 限制，否则
+    // cursor 永远到不了右缘、`SetCursorPos` 也会被 ClipCursor 拒绝。`RIDEV_NOLEGACY`
+    // 把 legacy 路径都关了，OS 也不会再推 cursor 出界，所以放心。
     let rid = RAWINPUTDEVICE {
         usUsagePage: 0x01,
         usUsage: 0x02,
-        dwFlags: RIDEV_NOLEGACY | RIDEV_INPUTSINK,
+        dwFlags: RIDEV_NOLEGACY,
         hwndTarget: HWND(std::ptr::null_mut()),
     };
     let size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
     let result = unsafe { RegisterRawInputDevices(&[rid], size) };
-    if let Err(e) = result {
-        log::error!("RegisterRawInputDevices failed: {:?}", e);
-    } else {
-        log::info!("M4: raw input mouse registered (RIDEV_NOLEGACY | RIDEV_INPUTSINK)");
+    match result {
+        Ok(_) => log::info!("M4: raw input mouse registered (RIDEV_NOLEGACY)"),
+        Err(e) => {
+            // 注册失败 → M4 模式无法工作（若回退 GetCursorPos dx 模型，on_mac 期间
+            // 系统仍驱动物理 cursor，会触发上一版的"M4-A→M4-B→M4-A"死循环）。
+            // 不要悄悄退化；让进程退出，让用户先解决权限/会话问题再试。
+            log::error!(
+                "M4 FATAL: RegisterRawInputDevices failed: {:?} -- \
+                 RIDEV_NOLEGACY 在某些 remote-desktop / Hyper-V enhanced session 下 \
+                 可能失败；请在本机物理控制台会话下运行",
+                e
+            );
+        }
     }
 }
 
