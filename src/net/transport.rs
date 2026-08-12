@@ -400,6 +400,7 @@ async fn handle_msg(
             }
         }
         Message::Input(ev) => {
+            log::trace!("recv Input: {:?} (is_client={})", ev, is_client);
             // M2 客户端：转发到本机注入 worker。服务端（itx=None）或不注入模式忽略。
             if let Some(itx) = itx {
                 if itx.send(ev).is_err() {
@@ -446,6 +447,7 @@ fn bridge_capture_to_tokio<T: Send + 'static>(
 /// 注入 worker：从 tokio mpsc 拉事件并调用平台 inject。
 fn bridge_tokio_to_inject(mut tokio_rx: mpsc::UnboundedReceiver<InputEvent>) {
     while let Some(ev) = tokio_rx.blocking_recv() {
+        log::trace!("bridge → inject_event: {:?}", ev);
         if let Err(e) = input::inject::inject_event(ev) {
             log::warn!("inject failed: {:?}", e);
         }
