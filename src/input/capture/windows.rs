@@ -58,10 +58,19 @@ unsafe extern "system" fn low_level_kb_proc(code: i32, wparam: WPARAM, lparam: L
             let is_down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let state = if is_down { KeyState::Pressed } else { KeyState::Released };
             log::trace!("hook kb: vk=0x{:02X} hid=0x{:04X} state={:?} → forwarding", kbhs.vkCode, hid, state);
-            if let Ok(g) = HOOK_TX.lock() {
-                if let Some(tx) = g.as_ref() {
-                    let _ = tx.send(CaptureMsg::Input(InputEvent::Key(KeyEvent { hid, state })));
+            match HOOK_TX.lock() {
+                Ok(g) => {
+                    if let Some(tx) = g.as_ref() {
+                        if let Err(e) = tx.send(CaptureMsg::Input(InputEvent::Key(KeyEvent { hid, state }))) {
+                            log::error!("hook kb: tx.send failed: {:?}", e);
+                        } else {
+                            log::trace!("hook kb: tx.send OK");
+                        }
+                    } else {
+                        log::error!("hook kb: HOOK_TX is None!");
+                    }
                 }
+                Err(e) => log::error!("hook kb: HOOK_TX lock failed: {:?}", e),
             }
         }
         return LRESULT(1); // 吞掉：Win 前台程序不收此键
@@ -87,15 +96,25 @@ unsafe extern "system" fn low_level_mouse_proc(
                 let down = matches!(wp, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN);
                 let state = if down { KeyState::Pressed } else { KeyState::Released };
                 log::trace!("hook mouse: button={:?} state={:?} → forwarding & swallow", button, state);
-                if let Ok(g) = HOOK_TX.lock() {
-                    if let Some(tx) = g.as_ref() {
-                        let _ = tx.send(CaptureMsg::Input(InputEvent::Mouse(MouseEvent {
-                            dx: 0,
-                            dy: 0,
-                            button: Some(button),
-                            state: Some(state),
-                        })));
+                match HOOK_TX.lock() {
+                    Ok(g) => {
+                        if let Some(tx) = g.as_ref() {
+                            let ev = CaptureMsg::Input(InputEvent::Mouse(MouseEvent {
+                                dx: 0,
+                                dy: 0,
+                                button: Some(button),
+                                state: Some(state),
+                            }));
+                            if let Err(e) = tx.send(ev) {
+                                log::error!("hook mouse: tx.send failed: {:?}", e);
+                            } else {
+                                log::trace!("hook mouse: tx.send OK");
+                            }
+                        } else {
+                            log::error!("hook mouse: HOOK_TX is None!");
+                        }
                     }
+                    Err(e) => log::error!("hook mouse: HOOK_TX lock failed: {:?}", e),
                 }
                 return LRESULT(1); // 吞掉：Win 不响应点击
             }

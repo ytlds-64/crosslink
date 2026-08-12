@@ -213,10 +213,14 @@ async fn session_server(
         tokio::select! {
             // 捕获事件 → 发送到对端（M2 / M4 模式）
             Some(msg) = erx.recv(), if switch.is_none() => {
-                let wire_msg = match msg {
-                    CaptureMsg::Input(ev) => Message::Input(ev),
+                let wire_msg = match &msg {
+                    CaptureMsg::Input(ev) => {
+                        log::trace!("server: forwarding Input event: {:?}", ev);
+                        Message::Input(*ev)
+                    }
                     CaptureMsg::CursorState { on_mac, x, y } => {
-                        Message::CursorState(CursorState { on_mac, x, y })
+                        log::trace!("server: forwarding CursorState: on_mac={} x={} y={}", on_mac, x, y);
+                        Message::CursorState(CursorState { on_mac: *on_mac, x: *x, y: *y })
                     }
                 };
                 if let Err(e) = send_msg(&wr, &crypter, &wire_msg).await {
