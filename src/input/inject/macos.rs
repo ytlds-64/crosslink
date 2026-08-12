@@ -1,12 +1,14 @@
-//! macOS 输入注入（键盘 + 鼠标），基于 Core Graphics `CGEvent` / `CGEventPost`。
+//! macOS 输入注入（键盘 + 鼠标），基于 Core Graphics `CGEvent` / `CGEventPost`
+//! + `osascript`（System Events）双通道。
 //!
-//! 捕获端发来的 `InputEvent` 在此重建为原生 `CGEvent` 并 post 到 HID 事件流。
-//! 需要「辅助功能 / 输入监控」授权，否则 `CGEventCreate*` 在权限不足时返回 NULL
-//!（这里会返回 `Err` 并 log）。
+//! M5/Tahoe 上 `CGEventPost` 对键盘/鼠标点击可能被系统安全层静默丢弃；
+//! `osascript` 走 AppleScript `key code` / `click at` 绕过这个限制。
+//! 需要「辅助功能 / 输入监控」授权（`System Events` 依赖它）。
 //!
 //! 注意：本模块仅在 `cfg(target_os = "macos")` 下编译；沙箱无 Mac，仅做类型检查。
 
 use std::ffi::c_void;
+use std::process::Command;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
@@ -33,51 +35,55 @@ fn make_source() -> Result<CGEventSource> {
         .map_err(|_| anyhow!("macOS: failed to create CGEventSource (需要辅助功能/输入监控授权)"))
 }
 
+/// 通过 `osascript` + `System Events` 注入按键/点击。
+/// macOS Tahoe/M5 上 `CGEventPost(HID)` 被安全层静默丢弃——这段绕过它。
+fn osa(script: &str) {
+    match Command::new("osascript").arg("-e").arg(script).output() {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => log::warn!(
+            "osascript fail: {} {}",
+            String::from_utf8_lossy(&o.stdout).trim(),
+            String::from_utf8_lossy(&o.stderr).trim(),
+        ),
+        Err(e) => log::warn!("osascript spawn fail: {:?}", e),
+    }
+}
+
 /// 注入一条输入事件。返回 `Err` 表示系统调用失败（通常是权限不足）。
+/// 按键 / 鼠标点击走 `osascript`（`key code` / `click at`），光标移动保留 CGEventPost。
 pub fn inject_event(ev: InputEvent) -> Result<()> {
     match ev {
         InputEvent::Key(k) => {
             let kc = keycodes::mac::hid_to_mac_keycode(k.hid)
                 .ok_or_else(|| anyhow!("inject: unknown HID key 0x{:04X}", k.hid))?;
-            let source = make_source()?;
-            let cg = CGEvent::new_keyboard_event(source, kc as CGKeyCode, matches!(k.state, KeyState::Pressed))
-                .map_err(|_| anyhow!("macOS: CGEventCreateKeyboardEvent failed (权限?)"))?;
-            cg.post(CGEventTapLocation::HID);
-            log::trace!("inject: Key hid=0x{:04X} → mac_keycode={} via HIDSystemState+HID", k.hid, kc);
+            if matches!(k.state, KeyState::Pressed) {
+                // key code <N> 在 AppleScript 里做一次完整击键（down+up），所以
+                // 只响应 Pressed、忽略 Released。这样也自然处理了按住不放的重复。
+                let cmd = format!("tell application \"System Events\" to key code {}", kc);
+                log::trace!("osa: {} (mac_keycode={})", cmd, kc);
+                osa(&cmd);
+            }
             Ok(())
         }
         InputEvent::Mouse(m) => {
-            // 鼠标按键（按下 / 释放）
-            if let (Some(btn), Some(st)) = (m.button, m.state) {
-                let (mt, mb) = match (btn, st) {
-                    (MouseButton::Left, KeyState::Pressed) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
-                    (MouseButton::Left, KeyState::Released) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
-                    (MouseButton::Right, KeyState::Pressed) => (CGEventType::RightMouseDown, CGMouseButton::Right),
-                    (MouseButton::Right, KeyState::Released) => (CGEventType::RightMouseUp, CGMouseButton::Right),
-                    (MouseButton::Middle, KeyState::Pressed) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
-                    (MouseButton::Middle, KeyState::Released) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
-                };
-                let pos = *CURSOR.lock().unwrap();
-                let source = make_source()?;
-                let cg = CGEvent::new_mouse_event(source, mt, pos, mb)
-                    .map_err(|_| anyhow!("macOS: CGEventCreateMouseEvent failed (权限?)"))?;
-                cg.post(CGEventTapLocation::HID);
-                log::trace!("inject: Mouse button {:?}/{:?} at ({},{}) via HIDSystemState+HID", btn, st, pos.x, pos.y);
+            // 鼠标按键 — 用 osascript click at {X,Y}（会自动在最前面窗口点击）
+            if let (Some(_btn), Some(st)) = (m.button, m.state) {
+                if matches!(st, KeyState::Pressed) {
+                    let pos = *CURSOR.lock().unwrap();
+                    let cmd = format!(
+                        "tell application \"System Events\" to click at {{{}, {}}}",
+                        pos.x, pos.y
+                    );
+                    log::trace!("osa: click at ({}, {})", pos.x, pos.y);
+                    osa(&cmd);
+                }
             }
 
-            // 相对位移（累积到本地光标位置后再以绝对坐标 post）
+            // 相对位移（累积到本地光标位置；M4 期间不作为独立事件投递）
             if m.dx != 0 || m.dy != 0 {
                 let mut pos = CURSOR.lock().unwrap();
                 pos.x += m.dx as f64;
                 pos.y += m.dy as f64;
-                // M4：光标在 Mac 区域时才投递鼠标移动事件（光标隐藏时不投递）
-                let shown = *CURSOR_SHOWN.lock().unwrap();
-                if shown {
-                    let source = make_source()?;
-                    let cg = CGEvent::new_mouse_event(source, CGEventType::MouseMoved, *pos, CGMouseButton::Left)
-                        .map_err(|_| anyhow!("macOS: CGEventCreateMouseEvent (move) failed (权限?)"))?;
-                    cg.post(CGEventTapLocation::HID);
-                }
             }
             Ok(())
         }
@@ -119,16 +125,18 @@ pub fn handle_cursor_state(on_mac: bool, x: u32, y: u32) -> Result<()> {
     *CURSOR_SHOWN.lock().unwrap() = on_mac;
     if on_mac {
         let p = CGPoint { x: x as f64, y: y as f64 };
-        // 更新本地累积位置，让后续 button 事件在正确位置投递
         *CURSOR.lock().unwrap() = p;
-        // 强制移动 Mac 光标：post 一个 MouseMoved 事件到 HID 系统事件流
-        // （CGEventPost 需要辅助功能权限；现在和正常 inject 路径一致）
+        // CGEventPost + osascript 双路：CGEventPost 可能在 Tahoe 上被弃，再补一条 osascript
         let source = make_source()?;
         let cg = CGEvent::new_mouse_event(source, CGEventType::MouseMoved, p, CGMouseButton::Left)
             .map_err(|_| anyhow!("macOS: CGEventCreateMouseEvent(MouseMoved) failed (权限?)"))?;
         cg.post(CGEventTapLocation::HID);
-        // 系统级显示光标（CGDisplayShowCursor 是引用计数的、不需要 TCC）
-        // 主显示器 id 即可——跨显示器会被 macOS 路由
+        // osascript 后备：set position of mouse（如果 CGEventPost 没生效，它兜底）
+        let cmd = format!(
+            "tell application \"System Events\" to set position of mouse to {{{}, {}}}",
+            x, y
+        );
+        osa(&cmd);
         let _ = CGDisplay::main().show_cursor();
         log::trace!("m4 inject: cursor shown on Mac at ({}, {})", x, y);
     } else {
