@@ -22,8 +22,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, MSG,
     SetCursorPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
     WM_MOUSEWHEEL, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP,
 };
 
 use crate::input::event::{InputEvent, KeyEvent, KeyState, MouseButton, MouseEvent};
@@ -47,8 +48,16 @@ static HOOK_TX: Mutex<Option<mpsc::Sender<CaptureMsg>>> = Mutex::new(None);
 unsafe extern "system" fn low_level_kb_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && ON_MAC_HOOK.load(Ordering::Relaxed) {
         let kbhs = *(lparam.0 as *const KBDLLHOOKSTRUCT);
+        // 无条件 trace——确认 hook 确实被系统回调了（不管 vk 有没有 HID 映射）
+        log::info!("hook kb firing: vk=0x{:02X} scan=0x{:02X} up?={}", kbhs.vkCode, kbhs.scanCode, {
+            let wp = wparam.0 as u32;
+            wp == WM_KEYUP || wp == WM_SYSKEYUP
+        });
         if let Some(hid) = keycodes::vk_to_hid(kbhs.vkCode as u16) {
-            let is_down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+            let is_down = {
+                let wp = wparam.0 as u32;
+                wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN
+            };
             let state = if is_down { KeyState::Pressed } else { KeyState::Released };
             log::trace!("hook kb: vk=0x{:02X} hid=0x{:04X} state={:?} → forwarding", kbhs.vkCode, hid, state);
             match HOOK_TX.lock() {
@@ -78,6 +87,7 @@ unsafe extern "system" fn low_level_mouse_proc(
 ) -> LRESULT {
     if code >= 0 && ON_MAC_HOOK.load(Ordering::Relaxed) {
         let wp = wparam.0 as u32;
+        log::info!("hook mouse firing: wp=0x{:04X}", wp); // 无条件 trace：确认 hook 回调到达
         match wp {
             WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP
             | WM_MBUTTONDOWN | WM_MBUTTONUP => {
@@ -86,7 +96,7 @@ unsafe extern "system" fn low_level_mouse_proc(
                     WM_RBUTTONDOWN | WM_RBUTTONUP => MouseButton::Right,
                     _ => MouseButton::Middle,
                 };
-                let down = matches!(wp, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN);
+                let down = wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN;
                 let state = if down { KeyState::Pressed } else { KeyState::Released };
                 log::trace!("hook mouse: button={:?} state={:?} → forwarding & swallow", button, state);
                 match HOOK_TX.lock() {
