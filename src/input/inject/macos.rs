@@ -1,9 +1,12 @@
-//! macOS 输入注入（键盘 + 鼠标），基于 Core Graphics `CGEvent` / `CGEventPost`
-//! + `osascript`（System Events）双通道。
+//! macOS 输入注入（键盘 + 鼠标）。
 //!
-//! M5/Tahoe 上 `CGEventPost` 对键盘/鼠标点击可能被系统安全层静默丢弃；
-//! `osascript` 走 AppleScript `key code` / `click at` 绕过这个限制。
-//! 需要「辅助功能 / 输入监控」授权（`System Events` 依赖它）。
+//! **Deskflow 源码分析（OSXScreen.mm）的结论**：
+//! `CGEventCreateKeyboardEvent(nullptr, ...)` 和 `CGEventCreateMouseEvent(nullptr, ...)`
+//! —— 用 **NULL source** 创建事件。NULL 事件源让系统把它视作**本地原生事件**而非合成事件，
+//! 不会被 M5/Tahoe 的合成事件过滤器静默丢弃。我们的旧代码用 `CGEventSource::new(...)`
+//! 创建特定源的事件——这就是被沙箱阻挡的根因。
+//!
+//! 本模块现在走两条路：① NULL-source CGEvent（主路径，Deskflow 验证）② osascript（备用）。
 //!
 //! 注意：本模块仅在 `cfg(target_os = "macos")` 下编译；沙箱无 Mac，仅做类型检查。
 
@@ -13,27 +16,44 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use core_graphics::display::CGDisplay;
-use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton};
-use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use core_graphics::event::{CGEventTapLocation, CGEventType, CGMouseButton};
 use core_graphics::geometry::CGPoint;
 
 use crate::input::event::{InputEvent, KeyState, MouseButton};
 use crate::input::keycodes;
 
+// Deskflow 的核心发现：用 NULL source 创建的事件被视为"本地原生事件"，
+// 不受合成事件过滤器影响（M5/Tahoe 上 `CGEventPost` 静默失败的原因）。
+//
+// `source: *const c_void` 传 `std::ptr::null()` → 等价于 Deskflow 的 `CGEventCreateXxx(nullptr, ...)`。
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventCreateKeyboardEvent(
+        source: *const c_void,
+        virtualKey: u16,
+        keyDown: bool,
+    ) -> *mut c_void;
+
+    fn CGEventCreateMouseEvent(
+        source: *const c_void,
+        mouseType: u32,
+        mouseCursorPosition: CGPoint,
+        mouseButton: u32,
+    ) -> *mut c_void;
+
+    fn CGEventPost(tap: u32, event: *mut c_void);
+    fn CFRelease(cf: *mut c_void);
+    fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint) -> i32;
+}
+
+/// kCGHIDEventTap = 0（Deskflow 的 `CGEventPost(kCGHIDEventTap, ...)`）。
+const K_CG_HID_EVENT_TAP: u32 = 0;
+
 /// 客户端本地光标位置（由收到的相对位移累积）。绝对坐标用于 button 事件定位。
 static CURSOR: Mutex<CGPoint> = Mutex::new(CGPoint { x: 0.0, y: 0.0 });
 
-/// M4：当前光标是否显示在 Mac 上。`false` 时 inject_event 仍会累计位置但不实际
-/// 投递鼠标移动（避免在 Mac 隐藏光标的情况下还动它）。
+/// M4：当前光标是否显示在 Mac 上。
 static CURSOR_SHOWN: Mutex<bool> = Mutex::new(false);
-
-/// 创建事件源（每次使用新建，避免 move 问题；开销极小）。
-/// M5/Tahoe 上 `CombinedSessionState` 产生的合成事件可能被系统沙箱拦截；
-/// `HIDSystemState` 生成的 HID 系统事件被视为“真实硬件外设”，能绕过更严的过滤。
-fn make_source() -> Result<CGEventSource> {
-    CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| anyhow!("macOS: failed to create CGEventSource (需要辅助功能/输入监控授权)"))
-}
 
 /// 通过 `osascript` + `System Events` 注入按键/点击。
 /// macOS Tahoe/M5 上 `CGEventPost(HID)` 被安全层静默丢弃——这段绕过它。
@@ -49,43 +69,69 @@ fn osa(script: &str) {
     }
 }
 
-/// 注入一条输入事件。返回 `Err` 表示系统调用失败（通常是权限不足）。
-/// 按键 / 鼠标点击走 `osascript`（`key code` / `click at`），光标移动保留 CGEventPost。
+/// 注入一条输入事件（Deskflow NULL-source CGEvent 主路径 + osascript 备用）。
 pub fn inject_event(ev: InputEvent) -> Result<()> {
-    match ev {
-        InputEvent::Key(k) => {
-            let kc = keycodes::mac::hid_to_mac_keycode(k.hid)
-                .ok_or_else(|| anyhow!("inject: unknown HID key 0x{:04X}", k.hid))?;
-            if matches!(k.state, KeyState::Pressed) {
-                // key code <N> 在 AppleScript 里做一次完整击键（down+up），所以
-                // 只响应 Pressed、忽略 Released。这样也自然处理了按住不放的重复。
-                let cmd = format!("tell application \"System Events\" to key code {}", kc);
-                log::trace!("osa: {} (mac_keycode={})", cmd, kc);
-                osa(&cmd);
-            }
-            Ok(())
-        }
-        InputEvent::Mouse(m) => {
-            // 鼠标按键 — 用 osascript click at {X,Y}（会自动在最前面窗口点击）
-            if let (Some(_btn), Some(st)) = (m.button, m.state) {
-                if matches!(st, KeyState::Pressed) {
-                    let pos = *CURSOR.lock().unwrap();
-                    let cmd = format!(
-                        "tell application \"System Events\" to click at {{{}, {}}}",
-                        pos.x, pos.y
-                    );
-                    log::trace!("osa: click at ({}, {})", pos.x, pos.y);
+    unsafe {
+        match ev {
+            InputEvent::Key(k) => {
+                let kc = keycodes::mac::hid_to_mac_keycode(k.hid)
+                    .ok_or_else(|| anyhow!("inject: unknown HID key 0x{:04X}", k.hid))?;
+                let pressed = matches!(k.state, KeyState::Pressed);
+                // NULL-source CGEvent：系统视作原生事件（Deskflow 验证路径）
+                let raw = CGEventCreateKeyboardEvent(std::ptr::null(), kc, pressed);
+                if !raw.is_null() {
+                    CGEventPost(K_CG_HID_EVENT_TAP, raw);
+                    CFRelease(raw);
+                    log::trace!("cgevent: Key hid=0x{:04X} kc={} {} → NULL-source+HID",
+                        k.hid, kc, if pressed { "down" } else { "up" });
+                } else {
+                    log::warn!("cgevent: CGEventCreateKeyboardEvent returned NULL");
+                }
+                // osascript 备用
+                if pressed {
+                    let cmd = format!("tell application \"System Events\" to key code {}", kc);
                     osa(&cmd);
                 }
+                Ok(())
             }
+            InputEvent::Mouse(m) => {
+                // 鼠标按键
+                if let (Some(btn), Some(st)) = (m.button, m.state) {
+                    let pressed = matches!(st, KeyState::Pressed);
+                    let pos = *CURSOR.lock().unwrap();
+                    let (mtype, mbtn) = match (btn, pressed) {
+                        (MouseButton::Left, true) => (1u32, 0u32),   // kCGEventLeftMouseDown, kCGMouseButtonLeft
+                        (MouseButton::Left, false) => (2u32, 0u32),  // kCGEventLeftMouseUp
+                        (MouseButton::Right, true) => (3u32, 1u32),  // kCGEventRightMouseDown, kCGMouseButtonRight
+                        (MouseButton::Right, false) => (4u32, 1u32),
+                        (MouseButton::Middle, true) => (25u32, 2u32), // kCGEventOtherMouseDown, kCGMouseButtonCenter
+                        (MouseButton::Middle, false) => (26u32, 2u32),
+                    };
+                    let raw = CGEventCreateMouseEvent(std::ptr::null(), mtype, pos, mbtn);
+                    if !raw.is_null() {
+                        CGEventPost(K_CG_HID_EVENT_TAP, raw);
+                        CFRelease(raw);
+                        log::trace!("cgevent: Mouse {:?}/{:?} at ({:.0},{:.0}) → NULL-source+HID",
+                            btn, st, pos.x, pos.y);
+                    } else {
+                        log::warn!("cgevent: CGEventCreateMouseEvent returned NULL");
+                    }
+                    // osascript 备用（click at）
+                    if pressed {
+                        let cmd = format!("tell application \"System Events\" to click at {{{}, {}}}",
+                            pos.x, pos.y);
+                        osa(&cmd);
+                    }
+                }
 
-            // 相对位移（累积到本地光标位置；M4 期间不作为独立事件投递）
-            if m.dx != 0 || m.dy != 0 {
-                let mut pos = CURSOR.lock().unwrap();
-                pos.x += m.dx as f64;
-                pos.y += m.dy as f64;
+                // 相对位移（累积到本地光标位置）
+                if m.dx != 0 || m.dy != 0 {
+                    let mut pos = CURSOR.lock().unwrap();
+                    pos.x += m.dx as f64;
+                    pos.y += m.dy as f64;
+                }
+                Ok(())
             }
-            Ok(())
         }
     }
 }
@@ -126,16 +172,17 @@ pub fn handle_cursor_state(on_mac: bool, x: u32, y: u32) -> Result<()> {
     if on_mac {
         let p = CGPoint { x: x as f64, y: y as f64 };
         *CURSOR.lock().unwrap() = p;
-        // CGEventPost + osascript 双路：CGEventPost 可能在 Tahoe 上被弃，再补一条 osascript
-        let source = make_source()?;
-        let cg = CGEvent::new_mouse_event(source, CGEventType::MouseMoved, p, CGMouseButton::Left)
-            .map_err(|_| anyhow!("macOS: CGEventCreateMouseEvent(MouseMoved) failed (权限?)"))?;
-        cg.post(CGEventTapLocation::HID);
-        // osascript 兜底路径上轮被 `mouse 没有定义` 失败——AppleScript 里
-        // `System Events` 没有可写的 `mouse` 属性。光标定位保留 CGEventPost，
-        // 不在这里再调 osascript。
+        unsafe {
+            // Deskflow 的方法：CGWarpMouseCursorPosition + NULL-source MouseMoved
+            CGWarpMouseCursorPosition(p);
+            let raw = CGEventCreateMouseEvent(std::ptr::null(), 5u32, p, 0u32); // kCGEventMouseMoved=5, kCGMouseButtonLeft=0
+            if !raw.is_null() {
+                CGEventPost(K_CG_HID_EVENT_TAP, raw);
+                CFRelease(raw);
+            }
+        }
         let _ = CGDisplay::main().show_cursor();
-        log::trace!("m4 inject: cursor shown on Mac at ({}, {})", x, y);
+        log::trace!("m4: cursor shown on Mac at ({}, {})", x, y);
     } else {
         // 系统级隐藏光标（CGDisplayHideCursor 是引用计数的、不需要 TCC）
         // 主显示器 id 即可——跨显示器会被 macOS 路由
