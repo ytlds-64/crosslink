@@ -131,12 +131,9 @@ pub fn handle_cursor_state(on_mac: bool, x: u32, y: u32) -> Result<()> {
         let cg = CGEvent::new_mouse_event(source, CGEventType::MouseMoved, p, CGMouseButton::Left)
             .map_err(|_| anyhow!("macOS: CGEventCreateMouseEvent(MouseMoved) failed (权限?)"))?;
         cg.post(CGEventTapLocation::HID);
-        // osascript 后备：set position of mouse（如果 CGEventPost 没生效，它兜底）
-        let cmd = format!(
-            "tell application \"System Events\" to set position of mouse to {{{}, {}}}",
-            x, y
-        );
-        osa(&cmd);
+        // osascript 兜底路径上轮被 `mouse 没有定义` 失败——AppleScript 里
+        // `System Events` 没有可写的 `mouse` 属性。光标定位保留 CGEventPost，
+        // 不在这里再调 osascript。
         let _ = CGDisplay::main().show_cursor();
         log::trace!("m4 inject: cursor shown on Mac at ({}, {})", x, y);
     } else {
