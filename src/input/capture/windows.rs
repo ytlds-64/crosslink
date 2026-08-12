@@ -17,14 +17,16 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HINSTANCE, HWND, LRESULT, POINT, WPARAM, LPARAM};
+use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LRESULT, POINT, WPARAM, LPARAM};
+use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, MSG,
-    SetCursorPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEWHEEL, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    CallNextHookEx, CreateCursor, DispatchMessageW, GetCursorPos, GetMessageW, HHOOK, HCURSOR,
+    IDC_ARROW, KBDLLHOOKSTRUCT, LoadCursorW, MSG, OCR_NORMAL, SetCursorPos, SetSystemCursor,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEWHEEL,
+    WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
 };
 
 use crate::input::event::{InputEvent, KeyEvent, KeyState, MouseButton, MouseEvent};
@@ -42,14 +44,90 @@ static ON_MAC_HOOK: AtomicBool = AtomicBool::new(false);
 static HOOKS_OK: AtomicBool = AtomicBool::new(false);
 static HOOK_TX: Mutex<Option<mpsc::Sender<CaptureMsg>>> = Mutex::new(None);
 
-// （on_mac 期间 Win 光标仍然可见——这是我们故意接受的 UX 折中。）
-// 之前的 SetSystemCursor 透明光标方案虽然能把 Win 光标隐藏，但它是**全局系统资源**：
-// 一旦进程非正常退出（taskkill /F、电源断电、BSOD 等），改动会持续生效，整个系统
-// 的箭头光标都会变成透明。这是不可接受的"状态污染"。
-//
-// 现在的策略：完全不动系统光标资源。让 Win 光标在 on_mac 期间自由移动（用户能看到
-// 一个"幽灵光标"在 Win 屏上游走，但它不控制任何 Win app——hook 会吞掉所有按键/点击）。
-// 视觉上有点不优雅，但运行时干净，进程退出立刻回到原状。
+// M4 期间隐藏 Win 系统箭头光标。
+// 关键安全网：
+// 1. 启动时自愈（restore 一次）：万一上次 taskkill /F 残留透明光标，下次启动自动修复。
+// 2. SetConsoleCtrlHandler 捕获 Ctrl+C / 关闭窗口 → restore（绝大多数正常退出）。
+// 3. hook_thread 退出时 restore。
+// 已知限制：`taskkill /F` / 断电 / BSOD 仍然可能留下污染——用户需 `taskkill`（无 /F）做清理。
+static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// HCURSOR 是 `*mut c_void`（非 Send/Sync），需要 wrapper 才能放进 static。
+struct SendCursor(HCURSOR);
+unsafe impl Send for SendCursor {}
+unsafe impl Sync for SendCursor {}
+static ORIG_ARROW: Mutex<Option<SendCursor>> = Mutex::new(None);
+/// 1x1 全透明光标：AND 掩码全 1（透明），XOR 掩码全 0。
+const TRANSPARENT_AND: [u8; 2] = [0xFF, 0x00];
+const TRANSPARENT_XOR: [u8; 2] = [0x00, 0x00];
+
+/// M4 期间隐藏/恢复 Win 系统箭头光标。
+fn set_system_cursor_hidden(hidden: bool) {
+    if hidden == CURSOR_HIDDEN.load(Ordering::Relaxed) {
+        return;
+    }
+    unsafe {
+        if hidden {
+            let hinst: HINSTANCE = match GetModuleHandleW(None) {
+                Ok(h) => h.into(),
+                Err(e) => {
+                    log::error!("M4: GetModuleHandleW failed (cursor hide): {:?}", e);
+                    return;
+                }
+            };
+            match LoadCursorW(None, IDC_ARROW) {
+                Ok(orig) => match CreateCursor(
+                    hinst,
+                    0,
+                    0,
+                    1,
+                    1,
+                    TRANSPARENT_AND.as_ptr() as *const core::ffi::c_void,
+                    TRANSPARENT_XOR.as_ptr() as *const core::ffi::c_void,
+                ) {
+                    Ok(trans) => {
+                        if SetSystemCursor(trans, OCR_NORMAL).is_ok() {
+                            *ORIG_ARROW.lock().unwrap() = Some(SendCursor(orig));
+                            CURSOR_HIDDEN.store(true, Ordering::Relaxed);
+                            log::info!("M4: system cursor hidden (transparent) while on Mac");
+                        } else {
+                            log::error!("M4: SetSystemCursor(hide) failed");
+                        }
+                    }
+                    Err(e) => log::error!("M4: CreateCursor failed: {:?}", e),
+            },
+                Err(e) => log::error!("M4: LoadCursorW(arrow) failed: {:?}", e),
+            }
+        } else {
+            let orig = ORIG_ARROW
+                .lock()
+                .unwrap()
+                .take()
+                .map(|c| c.0)
+                .unwrap_or_else(|| LoadCursorW(None, IDC_ARROW).unwrap_or(HCURSOR(std::ptr::null_mut())));
+            let _ = SetSystemCursor(orig, OCR_NORMAL);
+            CURSOR_HIDDEN.store(false, Ordering::Relaxed);
+            log::info!("M4: system cursor restored");
+        }
+    }
+}
+
+/// Windows 控制台控制事件回调：Ctrl+C / 关闭窗口 / 注销 / 关机 时恢复光标。
+unsafe extern "system" fn console_ctrl_handler(_ctrl_type: u32) -> BOOL {
+    // 返回 FALSE 让 Windows 走默认处理（结束进程）；先恢复光标避免污染。
+    set_system_cursor_hidden(false);
+    BOOL(0) // FALSE → 不拦截，按默认处理
+}
+
+/// 注册控制台控制处理器；返回是否成功。
+fn install_console_ctrl_handler() {
+    unsafe {
+        if SetConsoleCtrlHandler(Some(console_ctrl_handler), true).is_ok() {
+            log::info!("M4: SetConsoleCtrlHandler installed (Ctrl+C / close window → restore cursor)");
+        } else {
+            log::warn!("M4: SetConsoleCtrlHandler failed");
+        }
+    }
+}
 
 unsafe extern "system" fn low_level_kb_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && ON_MAC_HOOK.load(Ordering::Relaxed) {
@@ -174,9 +252,8 @@ fn hook_thread(tx: mpsc::Sender<CaptureMsg>) {
             let _ = UnhookWindowsHookEx(m);
         }
         HOOKS_OK.store(false, Ordering::Relaxed);
-        // 注意：不再做任何"恢复系统光标"的清理——我们不用 SetSystemCursor，
-        // 所以进程无论怎么退出（Ctrl+C / taskkill /F / 电源断）都不会留下
-        // 状态污染。这是用 UX 折中换可靠性。
+        // hook 线程退出时恢复光标（兜底；正常路径由 SetConsoleCtrlHandler 处理）。
+        set_system_cursor_hidden(false);
     }
 }
 
@@ -184,6 +261,11 @@ fn hook_thread(tx: mpsc::Sender<CaptureMsg>) {
 pub fn start_capture(opts: CaptureOptions) -> Receiver<CaptureMsg> {
     let (tx, rx) = mpsc::channel();
     if opts.m4_mode {
+        // 自愈：启动时主动 restore 一次。万一上次 taskkill /F 残留了透明光标，
+        // 这次启动会立刻把它修回去。重复 restore 默认光标是 no-op。
+        set_system_cursor_hidden(false);
+        // 装控制台 ctrl handler，让 Ctrl+C / 关闭窗口也走 restore。
+        install_console_ctrl_handler();
         // M4：hook 线程吞掉 on_mac 期间的 Win 输入并转发；主循环用 GetCursorPos
         // 计算位移 + 驱动逻辑光标。--m4-fallback 不再需要单独处理（统一走此模型）。
         let tx_hook = tx.clone();
@@ -320,6 +402,7 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
                 // M4-A: 光标进入 Win 最右列（且之前不在最右列）→ 切到 Mac
                 if have_pos && p.x >= win_w_i - 1 && dx_fb > 0 {
                     let _ = unsafe { SetCursorPos(0, p.y) };
+                    set_system_cursor_hidden(true);
                     on_mac = true;
                     ON_MAC_HOOK.store(true, Ordering::Relaxed);
                     mac_cursor_x = 0;
@@ -350,6 +433,7 @@ fn run_capture_loop(tx: mpsc::Sender<CaptureMsg>, opts: CaptureOptions) {
                 // M4-B: mac 光标在左缘且继续向左 → 回到 Win
                 if mac_cursor_x <= 0 && dx_fb < 0 {
                     let _ = unsafe { SetCursorPos(win_w_i - 1, p.y) };
+                    set_system_cursor_hidden(false);
                     on_mac = false;
                     ON_MAC_HOOK.store(false, Ordering::Relaxed);
                     let _ = tx.send(CaptureMsg::CursorState {
