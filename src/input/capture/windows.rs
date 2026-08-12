@@ -46,14 +46,13 @@ static HOOK_TX: Mutex<Option<mpsc::Sender<CaptureMsg>>> = Mutex::new(None);
 // 这是有意选择的 UX 折中：不碰 SetSystemCursor 全局资源，进程怎么退出都干净。
 
 unsafe extern "system" fn low_level_kb_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 && ON_MAC_HOOK.load(Ordering::Relaxed) {
+    if code >= 0 {
         let kbhs = *(lparam.0 as *const KBDLLHOOKSTRUCT);
-        // 无条件 trace——确认 hook 确实被系统回调了（不管 vk 有没有 HID 映射）
-        log::info!("hook kb firing: vk=0x{:02X} scan=0x{:02X} up?={}", kbhs.vkCode, kbhs.scanCode, {
-            let wp = wparam.0 as u32;
-            wp == WM_KEYUP || wp == WM_SYSKEYUP
-        });
-        if let Some(hid) = keycodes::vk_to_hid(kbhs.vkCode as u16) {
+        let on_mac = ON_MAC_HOOK.load(Ordering::Relaxed);
+        // ERROR 级别 —— 绝对不被过滤。只要系统调了 hook，这行一定出现。
+        log::error!(">>> HOOK KB CALLED: vk=0x{:02X} scan=0x{:02X} on_mac={} <<<", kbhs.vkCode, kbhs.scanCode, on_mac);
+        if on_mac {
+            if let Some(hid) = keycodes::vk_to_hid(kbhs.vkCode as u16) {
             let is_down = {
                 let wp = wparam.0 as u32;
                 wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN
@@ -74,8 +73,9 @@ unsafe extern "system" fn low_level_kb_proc(code: i32, wparam: WPARAM, lparam: L
                 }
                 Err(e) => log::error!("hook kb: HOOK_TX lock failed: {:?}", e),
             }
+            }
+            return LRESULT(1); // 吞掉：Win 前台程序不收此键
         }
-        return LRESULT(1); // 吞掉：Win 前台程序不收此键
     }
     CallNextHookEx(HHOOK(std::ptr::null_mut()), code, wparam, lparam)
 }
@@ -85,10 +85,12 @@ unsafe extern "system" fn low_level_mouse_proc(
     wparam: WPARAM,
     _lparam: LPARAM,
 ) -> LRESULT {
-    if code >= 0 && ON_MAC_HOOK.load(Ordering::Relaxed) {
+    if code >= 0 {
         let wp = wparam.0 as u32;
-        log::info!("hook mouse firing: wp=0x{:04X}", wp); // 无条件 trace：确认 hook 回调到达
-        match wp {
+        let on_mac = ON_MAC_HOOK.load(Ordering::Relaxed);
+        log::error!(">>> HOOK MOUSE CALLED: wp=0x{:04X} on_mac={} <<<", wp, on_mac);
+        if on_mac {
+            match wp {
             WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP
             | WM_MBUTTONDOWN | WM_MBUTTONUP => {
                 let button = match wp {
@@ -133,6 +135,7 @@ unsafe extern "system" fn low_level_mouse_proc(
             }
             _ => {}
         }
+    }
     }
     CallNextHookEx(HHOOK(std::ptr::null_mut()), code, wparam, _lparam)
 }
