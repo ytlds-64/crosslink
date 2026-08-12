@@ -26,8 +26,10 @@ static CURSOR: Mutex<CGPoint> = Mutex::new(CGPoint { x: 0.0, y: 0.0 });
 static CURSOR_SHOWN: Mutex<bool> = Mutex::new(false);
 
 /// 创建事件源（每次使用新建，避免 move 问题；开销极小）。
+/// M5/Tahoe 上 `CombinedSessionState` 产生的合成事件可能被系统沙箱拦截；
+/// `HIDSystemState` 生成的 HID 系统事件被视为“真实硬件外设”，能绕过更严的过滤。
 fn make_source() -> Result<CGEventSource> {
-    CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+    CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow!("macOS: failed to create CGEventSource (需要辅助功能/输入监控授权)"))
 }
 
@@ -40,8 +42,8 @@ pub fn inject_event(ev: InputEvent) -> Result<()> {
             let source = make_source()?;
             let cg = CGEvent::new_keyboard_event(source, kc as CGKeyCode, matches!(k.state, KeyState::Pressed))
                 .map_err(|_| anyhow!("macOS: CGEventCreateKeyboardEvent failed (权限?)"))?;
-            cg.post(CGEventTapLocation::Session);
-            log::trace!("inject: Key hid=0x{:04X} → mac_keycode={} posted to Session tap", k.hid, kc);
+            cg.post(CGEventTapLocation::HID);
+            log::trace!("inject: Key hid=0x{:04X} → mac_keycode={} via HIDSystemState+HID", k.hid, kc);
             Ok(())
         }
         InputEvent::Mouse(m) => {
@@ -59,8 +61,8 @@ pub fn inject_event(ev: InputEvent) -> Result<()> {
                 let source = make_source()?;
                 let cg = CGEvent::new_mouse_event(source, mt, pos, mb)
                     .map_err(|_| anyhow!("macOS: CGEventCreateMouseEvent failed (权限?)"))?;
-                cg.post(CGEventTapLocation::Session);
-                log::trace!("inject: Mouse button {:?}/{:?} at ({},{}) posted to Session tap", btn, st, pos.x, pos.y);
+                cg.post(CGEventTapLocation::HID);
+                log::trace!("inject: Mouse button {:?}/{:?} at ({},{}) via HIDSystemState+HID", btn, st, pos.x, pos.y);
             }
 
             // 相对位移（累积到本地光标位置后再以绝对坐标 post）
@@ -74,7 +76,7 @@ pub fn inject_event(ev: InputEvent) -> Result<()> {
                     let source = make_source()?;
                     let cg = CGEvent::new_mouse_event(source, CGEventType::MouseMoved, *pos, CGMouseButton::Left)
                         .map_err(|_| anyhow!("macOS: CGEventCreateMouseEvent (move) failed (权限?)"))?;
-                    cg.post(CGEventTapLocation::Session);
+                    cg.post(CGEventTapLocation::HID);
                 }
             }
             Ok(())
@@ -124,7 +126,7 @@ pub fn handle_cursor_state(on_mac: bool, x: u32, y: u32) -> Result<()> {
         let source = make_source()?;
         let cg = CGEvent::new_mouse_event(source, CGEventType::MouseMoved, p, CGMouseButton::Left)
             .map_err(|_| anyhow!("macOS: CGEventCreateMouseEvent(MouseMoved) failed (权限?)"))?;
-        cg.post(CGEventTapLocation::Session);
+        cg.post(CGEventTapLocation::HID);
         // 系统级显示光标（CGDisplayShowCursor 是引用计数的、不需要 TCC）
         // 主显示器 id 即可——跨显示器会被 macOS 路由
         let _ = CGDisplay::main().show_cursor();
