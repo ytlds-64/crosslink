@@ -42,12 +42,50 @@ extern "C" {
     ) -> *mut c_void;
 
     fn CGEventPost(tap: u32, event: *mut c_void);
+    fn CGEventPostToPid(pid: i32, event: *mut c_void) -> i32;
     fn CFRelease(cf: *mut c_void);
     fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint) -> i32;
 }
 
 /// kCGHIDEventTap = 0（Deskflow 的 `CGEventPost(kCGHIDEventTap, ...)`）。
 const K_CG_HID_EVENT_TAP: u32 = 0;
+
+/// 双路投递：先打系统 tap（兼容 Deskflow 路径），再直塞到前台 PID 事件队列
+/// （M5/Tahoe 上 `CGEventPost` 被静默丢弃，`CGEventPostToPid` 是私有旁路）。
+unsafe fn dispatch(raw: *mut c_void) {
+    CGEventPost(K_CG_HID_EVENT_TAP, raw);
+    let pid = foreground_pid();
+    if pid > 0 {
+        let _ = CGEventPostToPid(pid, raw);
+        log::trace!("dispatch: posted via tap + to pid={}", pid);
+    } else {
+        log::warn!("dispatch: foreground_pid returned 0");
+    }
+}
+
+/// 拿到当前前台 App 的 PID——`NSWorkspace.frontmostApplication.processIdentifier`。
+/// 在 M5/Tahoe 上 `CGEventPost` 会被沙箱静默丢弃，`CGEventPostToPid` 直接绕过
+/// 系统 tap 通道，把事件塞到前台进程自己的 event queue 里。
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {
+    fn objc_getClass(name: *const u8) -> *const c_void;
+    fn sel_registerName(name: *const u8) -> *const c_void;
+    fn objc_msgSend(receiver: *const c_void, sel: *const c_void, ...) -> *const c_void;
+}
+
+unsafe fn foreground_pid() -> i32 {
+    let cls = objc_getClass(b"NSWorkspace\0".as_ptr());
+    let sel = sel_registerName(b"sharedWorkspace\0".as_ptr());
+    let ws = objc_msgSend(cls, sel);
+    let sel2 = sel_registerName(b"frontmostApplication\0".as_ptr());
+    let app = objc_msgSend(ws, sel2);
+    if app.is_null() {
+        return 0;
+    }
+    let sel3 = sel_registerName(b"processIdentifier\0".as_ptr());
+    let pid: i32 = objc_msgSend(app, sel3) as isize as i32;
+    pid
+}
 
 /// 客户端本地光标位置（由收到的相对位移累积）。绝对坐标用于 button 事件定位。
 static CURSOR: Mutex<CGPoint> = Mutex::new(CGPoint { x: 0.0, y: 0.0 });
@@ -80,7 +118,7 @@ pub fn inject_event(ev: InputEvent) -> Result<()> {
                 // NULL-source CGEvent：系统视作原生事件（Deskflow 验证路径）
                 let raw = CGEventCreateKeyboardEvent(std::ptr::null(), kc, pressed);
                 if !raw.is_null() {
-                    CGEventPost(K_CG_HID_EVENT_TAP, raw);
+                    dispatch(raw);
                     CFRelease(raw);
                     log::trace!("cgevent: Key hid=0x{:04X} kc={} {} → NULL-source+HID",
                         k.hid, kc, if pressed { "down" } else { "up" });
@@ -109,7 +147,7 @@ pub fn inject_event(ev: InputEvent) -> Result<()> {
                     };
                     let raw = CGEventCreateMouseEvent(std::ptr::null(), mtype, pos, mbtn);
                     if !raw.is_null() {
-                        CGEventPost(K_CG_HID_EVENT_TAP, raw);
+                        dispatch(raw);
                         CFRelease(raw);
                         log::trace!("cgevent: Mouse {:?}/{:?} at ({:.0},{:.0}) → NULL-source+HID",
                             btn, st, pos.x, pos.y);
@@ -140,19 +178,9 @@ pub fn inject_event(ev: InputEvent) -> Result<()> {
 //
 // 与 screen.rs 里读 [NSEvent mouseLocation] 同样的 objc_msgSend 套路。
 // 这里只发无返回值的消息（hide/unhide），不需要 ABI 复杂的返回类型。
-
-#[link(name = "AppKit", kind = "framework")]
-extern "C" {
-    fn objc_getClass(name: *const u8) -> *const c_void;
-    fn sel_registerName(name: *const u8) -> *const c_void;
-    fn objc_msgSend(receiver: *const c_void, sel: *const c_void);
-}
-
-unsafe fn set_nscursor_hidden(hidden: bool) {
-    let cls = objc_getClass(b"NSCursor\0".as_ptr());
-    let sel = sel_registerName(if hidden { b"hide\0".as_ptr() } else { b"unhide\0".as_ptr() });
-    objc_msgSend(cls, sel);
-}
+//
+//（已移除：set_nscursor_hidden 函数和旧的 NSCursor hide/unhide 路径
+// 不再使用——见 CGDisplay::main().show_cursor() / hide_cursor() 替代。）
 
 /// M4 无缝单光标：处理 Win server 发来的 `CursorState`。
 ///
@@ -177,7 +205,7 @@ pub fn handle_cursor_state(on_mac: bool, x: u32, y: u32) -> Result<()> {
             CGWarpMouseCursorPosition(p);
             let raw = CGEventCreateMouseEvent(std::ptr::null(), 5u32, p, 0u32); // kCGEventMouseMoved=5, kCGMouseButtonLeft=0
             if !raw.is_null() {
-                CGEventPost(K_CG_HID_EVENT_TAP, raw);
+                dispatch(raw);
                 CFRelease(raw);
             }
         }
